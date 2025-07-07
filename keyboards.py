@@ -1,37 +1,34 @@
-# keyboards.py (Версия для v6.0)
+# keyboards.py (Финальная, синхронизированная версия)
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
 def get_main_menu_keyboard() -> InlineKeyboardMarkup:
-    """Возвращает главное меню для пользователя с зарегистрированным сервером."""
+    """Возвращает главное меню для навигации."""
     keyboard = [
-        [InlineKeyboardButton("📊 Статус сервера", callback_data="menu_status")],
-        [InlineKeyboardButton("⚙️ Мой сервер и ключ", callback_data="menu_myserver")],
-        [InlineKeyboardButton("🗑️ Удалить сервер", callback_data="menu_delete")],
+        [InlineKeyboardButton("📊 Статус активного сервера", callback_data="menu_status")],
+        [InlineKeyboardButton("🗂️ Мои серверы", callback_data="menu_myservers")],
     ]
     return InlineKeyboardMarkup(keyboard)
 
-def get_start_keyboard() -> InlineKeyboardMarkup:
-    """Возвращает клавиатуру для нового пользователя с одной кнопкой 'Добавить сервер'."""
-    keyboard = [
-        [InlineKeyboardButton("➕ Добавить сервер", callback_data="menu_addserver")],
-    ]
+def get_server_list_keyboard(user_data: dict) -> InlineKeyboardMarkup:
+    """Динамически создает клавиатуру со списком серверов."""
+    keyboard = []
+    servers = user_data.get("servers", {})
+    active_server_name = user_data.get("active_server")
+
+    for server_name in servers:
+        button_text = f"✅ {server_name}" if server_name == active_server_name else server_name
+        keyboard.append([InlineKeyboardButton(button_text, callback_data=f"select_server_{server_name}")])
+    
+    keyboard.append([InlineKeyboardButton("➕ Добавить новый сервер", callback_data="add_server_start")])
     return InlineKeyboardMarkup(keyboard)
 
-def get_delete_confirmation_keyboard() -> InlineKeyboardMarkup:
-    """Возвращает клавиатуру для подтверждения удаления сервера."""
+def get_server_management_keyboard(server_name: str) -> InlineKeyboardMarkup:
+    """Возвращает клавиатуру для управления выбранным сервером."""
     keyboard = [
-        [
-            InlineKeyboardButton("Да, я уверен", callback_data="delete_confirm_yes"),
-            InlineKeyboardButton("Нет, оставить", callback_data="delete_confirm_no"),
-        ]
-    ]
-    return InlineKeyboardMarkup(keyboard)
-
-def get_myserver_keyboard() -> InlineKeyboardMarkup:
-    """Возвращает клавиатуру для меню 'Мой сервер'."""
-    keyboard = [
-        [InlineKeyboardButton("📋 Показать инструкцию по установке", callback_data="myserver_show_instructions")],
-        [InlineKeyboardButton("🔙 Назад в меню", callback_data="menu_back")],
+        [InlineKeyboardButton("🚀 Сделать активным", callback_data=f"set_active_{server_name}")],
+        [InlineKeyboardButton("📋 Показать инструкцию", callback_data=f"show_instructions_{server_name}")],
+        [InlineKeyboardButton("🗑️ Удалить сервер", callback_data=f"delete_server_{server_name}")],
+        [InlineKeyboardButton("🔙 К списку серверов", callback_data="menu_myservers")]
     ]
     return InlineKeyboardMarkup(keyboard)
