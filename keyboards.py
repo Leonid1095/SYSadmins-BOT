@@ -7,7 +7,61 @@ def get_main_menu_keyboard() -> InlineKeyboardMarkup:
     keyboard = [
         [InlineKeyboardButton("📊 Статус активного сервера", callback_data="menu_status")],
         [InlineKeyboardButton("🗂️ Мои серверы", callback_data="menu_myservers")],
+        [InlineKeyboardButton("🔔 Мониторинг и алерты", callback_data="menu_monitoring")],
     ]
+    return InlineKeyboardMarkup(keyboard)
+
+
+def get_monitoring_keyboard(is_subscribed: bool, settings: dict) -> InlineKeyboardMarkup:
+    """Клавиатура настроек мониторинга."""
+    sub_text = "🔕 Отписаться от алертов" if is_subscribed else "🔔 Подписаться на алерты"
+    sub_data = "monitor_unsub" if is_subscribed else "monitor_sub"
+
+    keyboard = [
+        [InlineKeyboardButton(sub_text, callback_data=sub_data)],
+    ]
+
+    if is_subscribed:
+        keyboard.append([InlineKeyboardButton(
+            f"💾 Порог диска: {settings.get('disk_warn', 80)}%",
+            callback_data="monitor_set_disk"
+        )])
+        keyboard.append([InlineKeyboardButton(
+            f"🧠 Порог RAM: {settings.get('ram_warn', 90)}%",
+            callback_data="monitor_set_ram"
+        )])
+        keyboard.append([InlineKeyboardButton(
+            f"🔥 Порог CPU Load: {settings.get('cpu_warn', 200)}%",
+            callback_data="monitor_set_cpu"
+        )])
+        keyboard.append([InlineKeyboardButton(
+            "📊 Текущий статус сервера", callback_data="monitor_status_now"
+        )])
+
+    keyboard.append([InlineKeyboardButton("🔙 Главное меню", callback_data="menu_back")])
+    return InlineKeyboardMarkup(keyboard)
+
+
+def get_threshold_keyboard(param: str, current: int) -> InlineKeyboardMarkup:
+    """Клавиатура выбора порога."""
+    if param == "cpu_warn":
+        values = [100, 150, 200, 300, 500]
+        fmt = "{}%"
+    else:
+        values = [70, 75, 80, 85, 90, 95]
+        fmt = "{}%"
+
+    keyboard = []
+    row = []
+    for v in values:
+        label = f"✅ {fmt.format(v)}" if v == current else fmt.format(v)
+        row.append(InlineKeyboardButton(label, callback_data=f"monitor_val_{param}_{v}"))
+        if len(row) == 3:
+            keyboard.append(row)
+            row = []
+    if row:
+        keyboard.append(row)
+    keyboard.append([InlineKeyboardButton("🔙 Назад", callback_data="menu_monitoring")])
     return InlineKeyboardMarkup(keyboard)
 
 def get_server_list_keyboard(user_data: dict) -> InlineKeyboardMarkup:
@@ -30,5 +84,15 @@ def get_server_management_keyboard(server_name: str) -> InlineKeyboardMarkup:
         [InlineKeyboardButton("📋 Показать инструкцию", callback_data=f"show_instructions_{server_name}")],
         [InlineKeyboardButton("🗑️ Удалить сервер", callback_data=f"delete_server_{server_name}")],
         [InlineKeyboardButton("🔙 К списку серверов", callback_data="menu_myservers")]
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
+def get_delete_confirm_keyboard(server_name: str) -> InlineKeyboardMarkup:
+    """Возвращает клавиатуру подтверждения удаления сервера."""
+    keyboard = [
+        [
+            InlineKeyboardButton("✅ Да, удалить", callback_data=f"confirm_delete_{server_name}"),
+            InlineKeyboardButton("❌ Отмена", callback_data=f"select_server_{server_name}"),
+        ]
     ]
     return InlineKeyboardMarkup(keyboard)

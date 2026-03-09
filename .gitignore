@@ -213,3 +213,4 @@ venv/
 # Локальная конфигурация с секретами
 config.py
 users.json
+monitor_subscribers.json
