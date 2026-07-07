@@ -2,10 +2,13 @@
 
 import logging
 import json
+import os
 import uuid
 import requests
 import re
 import asyncio
+import ipaddress
+import tempfile
 from functools import wraps
 from telegram import Update
 from telegram.ext import (
@@ -26,9 +29,16 @@ from keyboards import (
 )
 
 # --- Настройки ---
-USERS_FILE = "users.json"
-MONITOR_FILE = "/home/plg/telegram-server-bot/monitor_subscribers.json"
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+USERS_FILE = os.path.join(BASE_DIR, "users.json")
+MONITOR_FILE = os.path.join(BASE_DIR, "monitor_subscribers.json")
 ASK_SERVER_NAME, ASK_IP, CONFIRM_DELETE = range(3)
+
+# Ограничения на имя сервера. Имя попадает в callback_data (лимит Telegram 64 байта),
+# поэтому длину ограничиваем с запасом на самый длинный префикс (show_instructions_).
+MAX_SERVER_NAME_LEN = 24
+SERVER_NAME_RE = re.compile(r'^[\w .\-]+$', re.UNICODE)
+LONGEST_CB_PREFIX = "show_instructions_"
 
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -40,13 +50,34 @@ def escape_markdown(text: str) -> str:
     escape_chars = r'_*[]()~`>#+-=|{}.!'
     return re.sub(f'([{re.escape(escape_chars)}])', r'\\\1', text)
 
+def _atomic_write_json(path: str, data) -> None:
+    """Атомарная запись JSON: во временный файл + fsync + rename.
+
+    Гарантирует, что читатель (в т.ч. cron monitor_remote.py) никогда не увидит
+    частично записанный/битый файл, а сбой в момент записи не приведёт к потере данных.
+    """
+    directory = os.path.dirname(path) or "."
+    fd, tmp = tempfile.mkstemp(dir=directory, prefix=".tmp-", suffix=".json")
+    try:
+        with os.fdopen(fd, 'w', encoding='utf-8') as f:
+            json.dump(data, f, indent=4, ensure_ascii=False)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
 def load_users():
     try:
         with open(USERS_FILE, 'r', encoding='utf-8') as f: return json.load(f)
     except (FileNotFoundError, json.JSONDecodeError): return {}
 
 def save_users(users_data):
-    with open(USERS_FILE, 'w', encoding='utf-8') as f: json.dump(users_data, f, indent=4, ensure_ascii=False)
+    _atomic_write_json(USERS_FILE, users_data)
 
 def load_monitor_subs():
     try:
@@ -54,44 +85,90 @@ def load_monitor_subs():
     except (FileNotFoundError, json.JSONDecodeError): return {}
 
 def save_monitor_subs(data):
-    with open(MONITOR_FILE, 'w', encoding='utf-8') as f: json.dump(data, f, indent=4, ensure_ascii=False)
+    _atomic_write_json(MONITOR_FILE, data)
 
 DEFAULT_MONITOR_SETTINGS = {
     "enabled": True,
     "disk_warn": 80,
     "ram_warn": 90,
-    "cpu_warn": 200,
+    "cpu_warn": 90,   # проценты (0..100), как отдаёт агент psutil.cpu_percent
+    "gpu_temp_warn": 80,
 }
 
 def is_valid_ip(ip: str) -> bool:
-    parts = ip.split('.')
-    if len(parts) != 4: return False
+    """Проверяет, что это публичный IPv4-адрес.
+
+    Отклоняем частные/loopback/link-local/multicast/зарезервированные диапазоны,
+    чтобы бот и удалённый монитор нельзя было заставить обращаться во внутреннюю
+    сеть хоста (SSRF), например к 127.0.0.1 или 169.254.169.254 (метаданные облака).
+    """
     try:
-        return all(0 <= int(part) <= 255 for part in parts)
-    except ValueError: return False
+        addr = ipaddress.ip_address(ip.strip())
+    except ValueError:
+        return False
+    if addr.version != 4:
+        return False
+    if (addr.is_private or addr.is_loopback or addr.is_link_local
+            or addr.is_multicast or addr.is_reserved or addr.is_unspecified):
+        return False
+    return True
+
+def validate_server_name(name: str, existing: dict) -> str | None:
+    """Возвращает текст ошибки или None, если имя корректно.
+
+    existing — словарь уже добавленных серверов пользователя (для проверки уникальности).
+    """
+    if not name:
+        return "Имя не может быть пустым."
+    if len(name) > MAX_SERVER_NAME_LEN:
+        return f"Слишком длинное имя (макс. {MAX_SERVER_NAME_LEN} символов)."
+    if not SERVER_NAME_RE.match(name):
+        return "Допустимы буквы, цифры, пробел, точка, дефис и подчёркивание."
+    # Гарантируем, что имя влезет в callback_data Telegram (лимит 64 байта)
+    if len((LONGEST_CB_PREFIX + name).encode('utf-8')) > 64:
+        return "Имя слишком длинное для кнопок Telegram, сократите его."
+    if name in existing:
+        return "Сервер с таким именем уже есть — выберите другое имя."
+    return None
 
 def server_registered(func):
     @wraps(func)
     async def wrapped(update: Update, context: ContextTypes.DEFAULT_TYPE, *args, **kwargs):
         user_id = str(update.effective_user.id)
         if user_id not in load_users():
-            await update.message.reply_text(r"❗️ У вас нет зарегистрированных серверов\. Используйте /start, чтобы добавить\.", parse_mode='MarkdownV2')
+            # Работает и для callback (update.message is None), и для обычных сообщений
+            if update.callback_query:
+                await update.callback_query.answer("Сначала добавьте сервер через /start", show_alert=True)
+            elif update.effective_message:
+                await update.effective_message.reply_text(
+                    r"❗️ У вас нет зарегистрированных серверов\. Используйте /start, чтобы добавить\.",
+                    parse_mode='MarkdownV2')
             return
         return await func(update, context, *args, **kwargs)
     return wrapped
 
 def get_status_text(data: dict, server_name: str) -> str:
     cpu = escape_markdown(data.get('cpu', 'N/A'))
+    cpu_temp = data.get('cpu_temp')
+    cpu_temp_text = f", {escape_markdown(str(cpu_temp))}°C" if cpu_temp is not None else ""
     mem = data.get('memory', {})
     disk = data.get('disk', {})
     mem_text = f"Использовано {escape_markdown(mem.get('used', 'N/A'))} / {escape_markdown(mem.get('total', 'N/A'))} ГБ \\({escape_markdown(mem.get('percent', 'N/A'))}%\\)"
     disk_text = f"Использовано {escape_markdown(disk.get('used', 'N/A'))} / {escape_markdown(disk.get('total', 'N/A'))} ГБ \\({escape_markdown(disk.get('percent', 'N/A'))}%\\)"
-    return (
+    text = (
         f"*📊 Статус сервера «{escape_markdown(server_name)}»*\n\n"
-        f"🔥 *Процессор:* {cpu}%\n"
+        f"🔥 *Процессор:* {cpu}%{cpu_temp_text}\n"
         f"🧠 *Память:* {mem_text}\n"
         f"💾 *Диск:* {disk_text}"
     )
+    gpu = data.get('gpu')
+    if gpu:
+        text += (
+            f"\n🎮 *GPU:* {escape_markdown(gpu.get('name', 'N/A'))} — "
+            f"нагрузка {escape_markdown(str(gpu.get('load', 'N/A')))}%, "
+            f"температура {escape_markdown(str(gpu.get('temp', 'N/A')))}°C"
+        )
+    return text
 
 async def send_or_edit(update: Update, text: str, reply_markup=None):
     if update.callback_query:
@@ -117,7 +194,7 @@ async def myservers_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(query.from_user.id)
     users = load_users()
     user_data = users.get(user_id, {"servers": {}})
-    text = "🗂️ *Ваши серверы*\n\nВыберите сервер для управления или добавьте новый\."
+    text = "🗂️ *Ваши серверы*\n\nВыберите сервер для управления или добавьте новый\\."
     await query.edit_message_text(text, reply_markup=get_server_list_keyboard(user_data), parse_mode='MarkdownV2')
 
 async def select_server_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -129,12 +206,12 @@ async def select_server_callback(update: Update, context: ContextTypes.DEFAULT_T
     server_data = users.get(user_id, {}).get("servers", {}).get(server_name)
 
     if not server_data:
-        await query.edit_message_text("❌ Ошибка: Сервер не найден\.", parse_mode='MarkdownV2')
+        await query.edit_message_text("❌ Ошибка: Сервер не найден\\.", parse_mode='MarkdownV2')
         return
 
     text = (
         f"⚙️ *Управление сервером «{escape_markdown(server_name)}»*\n\n"
-        f"**IP\-адрес:** `{escape_markdown(server_data['server_ip'])}`\n"
+        f"**IP\\-адрес:** `{escape_markdown(server_data['server_ip'])}`\n"
         f"**Ключ:** `{escape_markdown(server_data['secret_key'])}`"
     )
     await query.edit_message_text(text, reply_markup=get_server_management_keyboard(server_name), parse_mode='MarkdownV2')
@@ -149,10 +226,10 @@ async def set_active_server_callback(update: Update, context: ContextTypes.DEFAU
     if user_id in users and server_name in users[user_id].get("servers", {}):
         users[user_id]['active_server'] = server_name
         save_users(users)
-        await query.edit_message_text(f"✅ Сервер «{escape_markdown(server_name)}» назначен активным\.", parse_mode='MarkdownV2')
+        await query.edit_message_text(f"✅ Сервер «{escape_markdown(server_name)}» назначен активным\\.", parse_mode='MarkdownV2')
         await start_command(update, context)
     else:
-        await query.edit_message_text("❌ Ошибка: Не удалось установить активный сервер\.", parse_mode='MarkdownV2')
+        await query.edit_message_text("❌ Ошибка: Не удалось установить активный сервер\\.", parse_mode='MarkdownV2')
 
 # --- ВОССТАНОВЛЕННАЯ ФУНКЦИЯ ---
 @server_registered
@@ -169,7 +246,7 @@ async def show_instructions_callback(update: Update, context: ContextTypes.DEFAU
     
     text = (
         f"📋 *Инструкция по установке агента для сервера «{escape_markdown(server_name)}»*\n\n"
-        f"1\\. Выполните на сервере \(от `root`\) одну команду:\n"
+        f"1\\. Выполните на сервере \\(от `root`\\) одну команду:\n"
         f"```bash\nwget -qO- {AGENT_URL} | bash -s -- --key {secret_key}\n```"
     )
     # Отправляем новым сообщением, чтобы не затирать меню управления
@@ -184,7 +261,7 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_data = users.get(user_id)
 
     if not user_data or 'active_server' not in user_data:
-        await query.edit_message_text("❗️ Активный сервер не выбран\. Пожалуйста, выберите его в меню «Мои серверы»\.", reply_markup=get_main_menu_keyboard(), parse_mode='MarkdownV2')
+        await query.edit_message_text("❗️ Активный сервер не выбран\\. Пожалуйста, выберите его в меню «Мои серверы»\\.", reply_markup=get_main_menu_keyboard(), parse_mode='MarkdownV2')
         return
 
     active_server_name = user_data['active_server']
@@ -194,8 +271,7 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     headers = {"X-Secret-Key": secret_key}
     
     try:
-        loop = asyncio.get_event_loop()
-        response = await loop.run_in_executor(None, lambda: requests.get(url, headers=headers, timeout=10))
+        response = await asyncio.to_thread(requests.get, url, headers=headers, timeout=10)
         response.raise_for_status()
         status_message = get_status_text(response.json(), active_server_name)
         await query.edit_message_text(status_message, reply_markup=get_main_menu_keyboard(), parse_mode='MarkdownV2')
@@ -299,7 +375,7 @@ async def monitor_set_threshold(update: Update, context: ContextTypes.DEFAULT_TY
     subs = load_monitor_subs()
     current = subs.get(user_id, DEFAULT_MONITOR_SETTINGS).get(param, 80)
 
-    labels = {"disk_warn": "💾 Порог диска", "ram_warn": "🧠 Порог RAM", "cpu_warn": "🔥 Порог CPU Load"}
+    labels = {"disk_warn": "💾 Порог диска", "ram_warn": "🧠 Порог RAM", "cpu_warn": "🔥 Порог CPU", "gpu_temp_warn": "🎮 Порог температуры GPU"}
     text = f"*{escape_markdown(labels.get(param, param))}*\n\nВыберите значение:"
 
     await query.edit_message_text(
@@ -310,10 +386,10 @@ async def monitor_set_threshold(update: Update, context: ContextTypes.DEFAULT_TY
 
 async def monitor_set_value(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    # monitor_val_disk_warn_80
-    parts = query.data.split("_")
-    value = int(parts[-1])
-    param = parts[-3] + "_" + parts[-2]  # disk_warn, ram_warn, cpu_warn
+    # monitor_val_disk_warn_80 или monitor_val_gpu_temp_warn_80
+    data = query.data  # "monitor_val_<param>_<value>"
+    value = int(data.rsplit("_", 1)[-1])
+    param = data.removeprefix("monitor_val_").rsplit("_", 1)[0]  # disk_warn, ram_warn, cpu_warn, gpu_temp_warn
 
     user_id = str(query.from_user.id)
     subs = load_monitor_subs()
@@ -357,32 +433,22 @@ async def monitor_status_now(update: Update, context: ContextTypes.DEFAULT_TYPE)
     secret_key = server_info.get('secret_key', '')
 
     try:
-        loop = asyncio.get_event_loop()
         url = f"http://{server_ip}:5000/status"
         headers = {"X-Secret-Key": secret_key}
-        response = await loop.run_in_executor(
-            None, lambda: requests.get(url, headers=headers, timeout=10)
-        )
+        response = await asyncio.to_thread(requests.get, url, headers=headers, timeout=10)
         response.raise_for_status()
         data = response.json()
 
-        cpu = escape_markdown(str(data.get('cpu', 'N/A')))
-        mem = data.get('memory', {})
-        disk = data.get('disk', {})
-
-        text = (
-            f"📊 *Статус сервера «{escape_markdown(active_name)}»*\n"
-            f"IP: `{escape_markdown(server_ip)}`\n\n"
-            f"🔥 *CPU:* {cpu}%\n"
-            f"🧠 *RAM:* {escape_markdown(mem.get('used', '?'))}/{escape_markdown(mem.get('total', '?'))} GB "
-            f"\\({escape_markdown(str(mem.get('percent', '?')))}%\\)\n"
-            f"💾 *Диск:* {escape_markdown(disk.get('used', '?'))}/{escape_markdown(disk.get('total', '?'))} GB "
-            f"\\({escape_markdown(str(disk.get('percent', '?')))}%\\)\n\n"
-            f"*Ваши пороги:*\n"
+        # Переиспользуем единое форматирование статуса и добавляем IP + пороги
+        thresholds = (
+            "\n\n📍 IP: `" + escape_markdown(server_ip) + "`\n\n"
+            "*Ваши пороги:*\n"
             f"  💾 Диск: {settings.get('disk_warn', 80)}%\n"
             f"  🧠 RAM: {settings.get('ram_warn', 90)}%\n"
-            f"  🔥 CPU: {settings.get('cpu_warn', 200)}%"
+            f"  🔥 CPU: {settings.get('cpu_warn', 90)}%\n"
+            f"  🎮 GPU температура: {settings.get('gpu_temp_warn', 80)}°C"
         )
+        text = get_status_text(data, active_name) + thresholds
     except requests.exceptions.RequestException:
         text = (
             f"⛔️ *Не удалось подключиться к серверу*\n"
@@ -405,7 +471,16 @@ async def addserver_start(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     return ASK_SERVER_NAME
 
 async def ask_server_name_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    context.user_data['server_name'] = update.message.text.strip()
+    name = update.message.text.strip()
+    user_id = str(update.effective_user.id)
+    existing = load_users().get(user_id, {}).get("servers", {})
+    error = validate_server_name(name, existing)
+    if error:
+        await update.message.reply_text(
+            fr"❌ {escape_markdown(error)} Попробуйте снова или /cancel\.",
+            parse_mode='MarkdownV2')
+        return ASK_SERVER_NAME
+    context.user_data['server_name'] = name
     await update.message.reply_text(r"Теперь введите **IP\-адрес** этого сервера\.", parse_mode='MarkdownV2')
     return ASK_IP
 
@@ -453,8 +528,6 @@ async def confirm_delete_callback(update: Update, context: ContextTypes.DEFAULT_
             users[user_id]["active_server"] = remaining[0] if remaining else ""
         if not users[user_id]["servers"]:
             del users[user_id]
-        else:
-            save_users(users)
         save_users(users)
         await query.edit_message_text(
             fr"✅ Сервер `{escape_markdown(server_name)}` удалён\.",
@@ -468,7 +541,7 @@ async def confirm_delete_callback(update: Update, context: ContextTypes.DEFAULT_
             parse_mode='MarkdownV2'
         )
     else:
-        await query.edit_message_text("❌ Сервер не найден\.", parse_mode='MarkdownV2')
+        await query.edit_message_text("❌ Сервер не найден\\.", parse_mode='MarkdownV2')
 
 async def cancel_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     await send_or_edit(update, r"❌ Действие отменено\.")
@@ -508,7 +581,7 @@ def main():
     application.add_handler(CallbackQueryHandler(monitoring_menu, pattern='^menu_monitoring$'))
     application.add_handler(CallbackQueryHandler(monitor_subscribe, pattern='^monitor_sub$'))
     application.add_handler(CallbackQueryHandler(monitor_unsubscribe, pattern='^monitor_unsub$'))
-    application.add_handler(CallbackQueryHandler(monitor_set_threshold, pattern=r'^monitor_set_(disk|ram|cpu)$'))
+    application.add_handler(CallbackQueryHandler(monitor_set_threshold, pattern=r'^monitor_set_(disk|ram|cpu|gpu_temp)$'))
     application.add_handler(CallbackQueryHandler(monitor_set_value, pattern=r'^monitor_val_'))
     application.add_handler(CallbackQueryHandler(monitor_status_now, pattern='^monitor_status_now$'))
 

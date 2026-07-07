@@ -9,12 +9,23 @@ import json
 import os
 import requests
 import sys
+import tempfile
 
-BOT_TOKEN = "***REVOKED_SECRET_REMOVED***"
-OWNER_ID = "1148520376"
-USERS_FILE = "/home/plg/telegram-server-bot/users.json"
-SUBS_FILE = "/home/plg/telegram-server-bot/monitor_subscribers.json"
-STATE_FILE = "/tmp/server-monitor-remote-state.json"
+# Токен и OWNER_ID берём из единого источника config.py (в .gitignore),
+# с фолбэком на переменные окружения. Никакого хардкода секретов в этом файле.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+try:
+    import config
+    BOT_TOKEN = config.TELEGRAM_TOKEN
+    OWNER_ID = str(config.OWNER_ID)
+except Exception:
+    BOT_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
+    OWNER_ID = os.getenv("OWNER_ID", "")
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+USERS_FILE = os.path.join(BASE_DIR, "users.json")
+SUBS_FILE = os.path.join(BASE_DIR, "monitor_subscribers.json")
+STATE_FILE = f"/tmp/server-monitor-remote-state-{os.getuid()}.json"
 
 
 def load_json(path):
@@ -26,8 +37,21 @@ def load_json(path):
 
 
 def save_json(path, data):
-    with open(path, 'w') as f:
-        json.dump(data, f, indent=2)
+    """Атомарная запись: пишем во временный файл и переименовываем."""
+    directory = os.path.dirname(path) or "."
+    fd, tmp = tempfile.mkstemp(dir=directory, prefix=".tmp-", suffix=".json")
+    try:
+        with os.fdopen(fd, 'w') as f:
+            json.dump(data, f, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
 
 
 def send_alert(chat_id, msg):
@@ -61,6 +85,11 @@ def main():
 
         disk_warn = sub_cfg.get("disk_warn", 80)
         ram_warn = sub_cfg.get("ram_warn", 90)
+        gpu_temp_warn = sub_cfg.get("gpu_temp_warn", 80)
+        cpu_warn = int(sub_cfg.get("cpu_warn", 90))
+        # Миграция старых «load-style» значений (100..500) в проценты 0..100
+        if cpu_warn > 100:
+            cpu_warn = 90
 
         user_state = state.setdefault(user_id, {})
 
@@ -111,14 +140,30 @@ def main():
                 elif ram_pct < ram_warn - 10:
                     srv_state["ram_warn"] = False
 
-                # CPU
+                # CPU — используем пользовательский порог cpu_warn (в процентах)
                 cpu_pct = float(data.get("cpu", 0))
-                if cpu_pct >= 90:
+                if cpu_pct >= cpu_warn:
                     if not srv_state.get("cpu_warn"):
-                        alerts.append(f"🔴 <b>CPU:</b> {cpu_pct}%")
+                        alerts.append(f"🔴 <b>CPU:</b> {cpu_pct}% (порог {cpu_warn}%)")
                         srv_state["cpu_warn"] = True
-                elif cpu_pct < 70:
+                elif cpu_pct < cpu_warn - 10:
                     srv_state["cpu_warn"] = False
+
+                # GPU
+                gpu = data.get("gpu")
+                if gpu:
+                    gpu_temp = gpu.get("temp", 0)
+                    gpu_load = gpu.get("load", 0)
+                    gpu_name = gpu.get("name", "GPU")
+                    if gpu_temp >= gpu_temp_warn:
+                        if not srv_state.get("gpu_temp_warn"):
+                            alerts.append(
+                                f"🔴 <b>GPU ПЕРЕГРЕВ:</b> {gpu_name} — {gpu_temp}°C "
+                                f"(нагрузка {gpu_load}%)"
+                            )
+                            srv_state["gpu_temp_warn"] = True
+                    elif gpu_temp < gpu_temp_warn - 10:
+                        srv_state["gpu_temp_warn"] = False
 
             except requests.exceptions.RequestException:
                 if not srv_state.get("offline"):

@@ -1,0 +1,40 @@
+# ============================================================
+# Локальные настройки monitor.sh — скопируйте в monitor.local.conf
+#   cp monitor.local.conf.example monitor.local.conf
+# Файл monitor.local.conf в .gitignore и НЕ коммитится.
+# Здесь переопределяются пороги и цели без правки самого скрипта.
+# ============================================================
+
+# --- Пороги ресурсов ---
+# DISK_WARN=80
+# DISK_CRIT=90
+# RAM_WARN=90
+# CPU_WARN=85          # % утилизации CPU (предупреждение)
+# CPU_CRIT=95          # % утилизации CPU (критично)
+# LOAD_WARN=150        # load average в % на ядро (150 = 1.5×ядер)
+# LOAD_CRIT=300
+# GPU_TEMP_WARN=75
+# GPU_TEMP_CRIT=85
+
+# --- HDD бэкапов (пусто — отключить) ---
+# HDD_MOUNT="/mnt/hdd"
+# SMART_DISK="/dev/sda"
+
+# --- Критичные сервисы (должны быть active). Упавшие (failed) ловятся автоматически. ---
+# CRITICAL_SERVICES="nginx postgresql docker fail2ban ssh redis-server"
+
+# --- systemd-юниты, которые НЕ алертить как failed (шум) ---
+# SERVICES_IGNORE="fwupd.service fwupd-refresh.service"
+
+# --- Docker: контейнеры-исключения (одноразовые/намеренно остановленные) ---
+# DOCKER_IGNORE="plg-text-web-1 some-oneshot-job"
+
+# --- HTTP-эндпоинты проектов: алерт при HTTP 000/5xx ---
+# Раскомментируйте нужные (проверка идёт с самого сервера):
+# ENDPOINTS=(
+#   "https://lkds-room.ru"
+#   "https://plgamesbot.ru"
+#   "https://svoboda3.ru"
+#   "https://uwow-guide.online"
+#   "https://plgames-voice.ru"
+# )

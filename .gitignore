@@ -214,3 +214,14 @@ venv/
 config.py
 users.json
 monitor_subscribers.json
+
+# Локальные переопределения мониторинга (пороги, эндпоинты)
+monitor.local.conf
+*.local.conf
+
+# Секреты окружения
+.env
+
+# Временные/state файлы монитора
+server-monitor-state
+*.tmp

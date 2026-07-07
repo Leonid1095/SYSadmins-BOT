@@ -31,8 +31,12 @@ def get_monitoring_keyboard(is_subscribed: bool, settings: dict) -> InlineKeyboa
             callback_data="monitor_set_ram"
         )])
         keyboard.append([InlineKeyboardButton(
-            f"🔥 Порог CPU Load: {settings.get('cpu_warn', 200)}%",
+            f"🔥 Порог CPU: {settings.get('cpu_warn', 90)}%",
             callback_data="monitor_set_cpu"
+        )])
+        keyboard.append([InlineKeyboardButton(
+            f"🎮 Порог GPU темп.: {settings.get('gpu_temp_warn', 80)}°C",
+            callback_data="monitor_set_gpu_temp"
         )])
         keyboard.append([InlineKeyboardButton(
             "📊 Текущий статус сервера", callback_data="monitor_status_now"
@@ -45,8 +49,11 @@ def get_monitoring_keyboard(is_subscribed: bool, settings: dict) -> InlineKeyboa
 def get_threshold_keyboard(param: str, current: int) -> InlineKeyboardMarkup:
     """Клавиатура выбора порога."""
     if param == "cpu_warn":
-        values = [100, 150, 200, 300, 500]
+        values = [70, 75, 80, 85, 90, 95]
         fmt = "{}%"
+    elif param == "gpu_temp_warn":
+        values = [70, 75, 80, 85, 90]
+        fmt = "{}°C"
     else:
         values = [70, 75, 80, 85, 90, 95]
         fmt = "{}%"

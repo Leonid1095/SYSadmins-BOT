@@ -62,12 +62,18 @@ echo_success "Скрипт агента скачан."
 # 4. Настройка виртуального окружения и установка библиотек
 echo_info "Создание виртуального окружения..."
 python3 -m venv venv
-echo_info "Установка Flask, psutil и gunicorn..."
-venv/bin/pip install --quiet --no-cache-dir Flask psutil gunicorn
+echo_info "Установка Flask, psutil и gunicorn (фиксированные версии)..."
+venv/bin/pip install --quiet --no-cache-dir "Flask==3.0.3" "psutil==6.0.0" "gunicorn==22.0.0"
 echo_success "Виртуальное окружение настроено."
 
 # 5. Создание файла сервиса systemd
 echo_info "Создание сервиса systemd ($SERVICE_NAME)..."
+
+# Секретный ключ — в отдельном файле с правами 0600 (не виден в самом юните)
+ENV_FILE="/etc/bot-agent.env"
+umask 077
+echo "SECRET_KEY=$SECRET_KEY" > "$ENV_FILE"
+chmod 600 "$ENV_FILE"
 
 # Используем cat с HEREDOC для создания файла. Это удобно и наглядно.
 cat <<EOF > /etc/systemd/system/$SERVICE_NAME
@@ -78,10 +84,16 @@ After=network.target
 [Service]
 User=root
 WorkingDirectory=$INSTALL_DIR
-Environment="SECRET_KEY=$SECRET_KEY"
+EnvironmentFile=$ENV_FILE
 ExecStart=$INSTALL_DIR/venv/bin/gunicorn --workers 1 --bind 0.0.0.0:5000 agent:app
 Restart=always
 RestartSec=3
+# Базовое усиление (не мешает psutil и nvidia-smi)
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=full
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
 
 [Install]
 WantedBy=multi-user.target

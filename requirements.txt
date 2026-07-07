@@ -1,0 +1,3 @@
+# Зависимости центрального бота (bot.py, monitor_remote.py)
+python-telegram-bot==22.6
+requests==2.32.5
