@@ -44,8 +44,12 @@ command -v python3 >/dev/null 2>&1 || { apt-get update -qq && apt-get install -y
 echo "INFO: установка в $INSTALL_DIR ..."
 mkdir -p "$INSTALL_DIR"
 
-# monitor.sh из репозитория
-curl -fsSL "$REPO_RAW/monitor.sh" -o "$INSTALL_DIR/monitor.sh"
+# monitor.sh из репозитория (с таймаутами, чтобы не зависнуть на сети/прокси)
+if ! curl -fsSL --connect-timeout 15 --max-time 60 --retry 2 \
+        "$REPO_RAW/monitor.sh" -o "$INSTALL_DIR/monitor.sh"; then
+    echo "❌ Не удалось скачать monitor.sh (сеть/прокси). Повторите позже." >&2
+    exit 1
+fi
 chmod 700 "$INSTALL_DIR/monitor.sh"
 
 # config.py с секретами (0600)
