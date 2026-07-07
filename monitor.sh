@@ -49,13 +49,14 @@ NTFY_URL=""        # self-hosted ntfy, напр. http://127.0.0.1:2586
 NTFY_TOPIC=""      # тема, напр. server-alerts
 NTFY_TOKEN=""      # опц., если ntfy требует авторизацию
 WEBHOOK_URL=""     # generic POST plain-text (на будущее: интеграции/SaaS)
+ALERT_EMAIL=""     # email через локальный MTA (postfix/mail) — работает без выставления наружу
 
 # Переопределения без правки скрипта (файл в .gitignore)
 [ -f "$SCRIPT_DIR/monitor.local.conf" ] && source "$SCRIPT_DIR/monitor.local.conf"
 
 # Должен быть настроен хотя бы один канал уведомлений
-if [ -z "$BOT_TOKEN" ] && [ -z "$NTFY_URL" ] && [ -z "$WEBHOOK_URL" ]; then
-    echo "monitor.sh: не настроен ни один канал уведомлений (Telegram/ntfy/webhook)" >&2
+if [ -z "$BOT_TOKEN" ] && [ -z "$NTFY_URL" ] && [ -z "$WEBHOOK_URL" ] && [ -z "$ALERT_EMAIL" ]; then
+    echo "monitor.sh: не настроен ни один канал уведомлений (Telegram/ntfy/webhook/email)" >&2
     exit 1
 fi
 
@@ -89,6 +90,13 @@ notify() {
     if [ -n "$WEBHOOK_URL" ]; then
         curl -s --max-time 15 -H "Content-Type: text/plain; charset=utf-8" \
             --data-binary "${msg}" "$WEBHOOK_URL" >/dev/null 2>&1
+    fi
+
+    # 4) Email через локальный MTA (работает, когда Telegram недоступен)
+    if [ -n "$ALERT_EMAIL" ] && command -v mail >/dev/null 2>&1; then
+        local plain
+        plain=$(printf '%s' "$msg" | sed -E 's/<[^>]+>//g; s/&lt;/</g; s/&gt;/>/g; s/&amp;/\&/g')
+        printf '%s\n' "$plain" | mail -s "Server Monitor: ${HOSTNAME}" "$ALERT_EMAIL"
     fi
 }
 

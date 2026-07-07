@@ -41,7 +41,9 @@
 
 # --- Каналы уведомлений (кроме Telegram) ---
 # Алерты уходят во ВСЕ настроенные каналы. Telegram работает из config.py.
-# ntfy — self-hosted push, доставляет даже когда Telegram недоступен/заблокирован:
+# Email через локальный MTA (postfix) — проще всего, без выставления наружу:
+# ALERT_EMAIL="you@example.com"
+# ntfy — self-hosted push (нужен выставленный наружу инстанс + токен при deny-all):
 # NTFY_URL="http://127.0.0.1:2586"
 # NTFY_TOPIC="server-alerts"
 # NTFY_TOKEN=""                       # если ntfy закрыт авторизацией
