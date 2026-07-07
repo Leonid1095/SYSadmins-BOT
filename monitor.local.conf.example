@@ -41,8 +41,13 @@
 
 # --- Каналы уведомлений (кроме Telegram) ---
 # Алерты уходят во ВСЕ настроенные каналы. Telegram работает из config.py.
-# Email через локальный MTA (postfix) — проще всего, без выставления наружу:
+# Email. Если провайдер блокирует исходящий :25 — через аутентифицированный релей
+# (пароль приложения, НЕ основной пароль аккаунта):
 # ALERT_EMAIL="you@example.com"
+# SMTP_HOST="smtp.yandex.ru"
+# SMTP_PORT="465"
+# SMTP_USER="you@yandex.ru"
+# SMTP_PASS="app-password"
 # ntfy — self-hosted push (нужен выставленный наружу инстанс + токен при deny-all):
 # NTFY_URL="http://127.0.0.1:2586"
 # NTFY_TOPIC="server-alerts"

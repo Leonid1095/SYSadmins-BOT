@@ -49,7 +49,13 @@ NTFY_URL=""        # self-hosted ntfy, напр. http://127.0.0.1:2586
 NTFY_TOPIC=""      # тема, напр. server-alerts
 NTFY_TOKEN=""      # опц., если ntfy требует авторизацию
 WEBHOOK_URL=""     # generic POST plain-text (на будущее: интеграции/SaaS)
-ALERT_EMAIL=""     # email через локальный MTA (postfix/mail) — работает без выставления наружу
+ALERT_EMAIL=""     # адрес получателя email-алертов
+# SMTP-релей (если прямой :25 заблокирован провайдером). Пусто = системный mail.
+SMTP_HOST=""       # напр. smtp.yandex.ru
+SMTP_PORT="465"    # 465 (SSL) или 587
+SMTP_USER=""       # логин = полный email
+SMTP_PASS=""       # ПАРОЛЬ ПРИЛОЖЕНИЯ (не основной пароль аккаунта)
+SMTP_FROM=""       # от кого (по умолчанию = SMTP_USER)
 
 # Переопределения без правки скрипта (файл в .gitignore)
 [ -f "$SCRIPT_DIR/monitor.local.conf" ] && source "$SCRIPT_DIR/monitor.local.conf"
@@ -92,11 +98,23 @@ notify() {
             --data-binary "${msg}" "$WEBHOOK_URL" >/dev/null 2>&1
     fi
 
-    # 4) Email через локальный MTA (работает, когда Telegram недоступен)
-    if [ -n "$ALERT_EMAIL" ] && command -v mail >/dev/null 2>&1; then
-        local plain
+    # 4) Email (работает, когда Telegram недоступен)
+    if [ -n "$ALERT_EMAIL" ]; then
+        local plain subject from
         plain=$(printf '%s' "$msg" | sed -E 's/<[^>]+>//g; s/&lt;/</g; s/&gt;/>/g; s/&amp;/\&/g')
-        printf '%s\n' "$plain" | mail -s "Server Monitor: ${HOSTNAME}" "$ALERT_EMAIL"
+        subject="Server Monitor: ${HOSTNAME}"
+        if [ -n "$SMTP_HOST" ] && [ -n "$SMTP_USER" ] && [ -n "$SMTP_PASS" ]; then
+            # Аутентифицированный релей через curl SMTP — не трогаем системный MTA,
+            # обходит блокировку исходящего :25 и работает на любом сервере
+            from="${SMTP_FROM:-$SMTP_USER}"
+            printf 'From: %s\r\nTo: %s\r\nSubject: %s\r\nContent-Type: text/plain; charset=UTF-8\r\n\r\n%s\r\n' \
+                "$from" "$ALERT_EMAIL" "$subject" "$plain" | \
+            curl -s --max-time 25 --ssl-reqd "smtps://${SMTP_HOST}:${SMTP_PORT:-465}" \
+                --mail-from "$from" --mail-rcpt "$ALERT_EMAIL" \
+                --user "${SMTP_USER}:${SMTP_PASS}" -T - >/dev/null 2>&1
+        elif command -v mail >/dev/null 2>&1; then
+            printf '%s\n' "$plain" | mail -s "$subject" "$ALERT_EMAIL"
+        fi
     fi
 }
 
