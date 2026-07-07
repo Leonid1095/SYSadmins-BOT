@@ -11,11 +11,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # --- Секреты: единый источник — config.py (в .gitignore) ---
 BOT_TOKEN=$(cd "$SCRIPT_DIR" && python3 -c "import config; print(config.TELEGRAM_TOKEN)" 2>/dev/null)
 OWNER_ID=$(cd "$SCRIPT_DIR" && python3 -c "import config; print(config.OWNER_ID)" 2>/dev/null)
-
-if [ -z "$BOT_TOKEN" ] || [ -z "$OWNER_ID" ]; then
-    echo "monitor.sh: не удалось прочитать BOT_TOKEN/OWNER_ID из config.py" >&2
-    exit 1
-fi
+# Проверка «настроен хотя бы один канал» — ниже, после загрузки monitor.local.conf
 
 # Per-user, чтобы не конфликтовать по владельцу в sticky /tmp (root/plg запуски)
 STATE_FILE="/tmp/server-monitor-state-$(id -u)"
@@ -48,20 +44,52 @@ DOCKER_IGNORE=""
 # HTTP-эндпоинты для проверки доступности проектов, напр. ENDPOINTS=("https://site.ru" ...)
 ENDPOINTS=()
 
+# --- Каналы уведомлений (кроме Telegram). Пусто = выключено. ---
+NTFY_URL=""        # self-hosted ntfy, напр. http://127.0.0.1:2586
+NTFY_TOPIC=""      # тема, напр. server-alerts
+NTFY_TOKEN=""      # опц., если ntfy требует авторизацию
+WEBHOOK_URL=""     # generic POST plain-text (на будущее: интеграции/SaaS)
+
 # Переопределения без правки скрипта (файл в .gitignore)
 [ -f "$SCRIPT_DIR/monitor.local.conf" ] && source "$SCRIPT_DIR/monitor.local.conf"
+
+# Должен быть настроен хотя бы один канал уведомлений
+if [ -z "$BOT_TOKEN" ] && [ -z "$NTFY_URL" ] && [ -z "$WEBHOOK_URL" ]; then
+    echo "monitor.sh: не настроен ни один канал уведомлений (Telegram/ntfy/webhook)" >&2
+    exit 1
+fi
 
 # --- Вспомогательные функции ---
 html_escape() {
     local s="$1"; s="${s//&/&amp;}"; s="${s//</&lt;}"; s="${s//>/&gt;}"; printf '%s' "$s"
 }
 
-send_alert() {
+# Отправка во ВСЕ настроенные каналы (гибко, не завязано на один Telegram)
+notify() {
     local msg="$1"
-    curl -s -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
-        --data-urlencode "chat_id=${OWNER_ID}" \
-        --data-urlencode "text=${msg}" \
-        --data-urlencode "parse_mode=HTML" >/dev/null 2>&1
+
+    # 1) Telegram
+    if [ -n "$BOT_TOKEN" ] && [ -n "$OWNER_ID" ]; then
+        curl -s --max-time 15 -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
+            --data-urlencode "chat_id=${OWNER_ID}" \
+            --data-urlencode "text=${msg}" \
+            --data-urlencode "parse_mode=HTML" >/dev/null 2>&1
+    fi
+
+    # 2) ntfy (self-hosted; работает, даже когда Telegram недоступен)
+    if [ -n "$NTFY_URL" ] && [ -n "$NTFY_TOPIC" ]; then
+        local plain args
+        plain=$(printf '%s' "$msg" | sed -E 's/<[^>]+>//g; s/&lt;/</g; s/&gt;/>/g; s/&amp;/\&/g')
+        args=(-s --max-time 15 -H "Title: Server Monitor" -H "Priority: high" -H "Tags: warning")
+        [ -n "$NTFY_TOKEN" ] && args+=(-H "Authorization: Bearer ${NTFY_TOKEN}")
+        curl "${args[@]}" -d "${plain}" "${NTFY_URL%/}/${NTFY_TOPIC}" >/dev/null 2>&1
+    fi
+
+    # 3) Generic webhook (на будущее: интеграции/SaaS)
+    if [ -n "$WEBHOOK_URL" ]; then
+        curl -s --max-time 15 -H "Content-Type: text/plain; charset=utf-8" \
+            --data-binary "${msg}" "$WEBHOOK_URL" >/dev/null 2>&1
+    fi
 }
 
 # Антиспам: состояние по точному совпадению строки (fixed-string, whole-line)
@@ -323,7 +351,7 @@ if [ ${#ALERTS[@]} -gt 0 ]; then
     MSG="🖥 <b>Сервер $(html_escape "$HOSTNAME")</b>"$'\n\n'
     MSG+=$(printf '%s\n' "${ALERTS[@]}")
     MSG+=$'\n'"⏰ $(date '+%d.%m.%Y %H:%M')"
-    send_alert "$MSG"
+    notify "$MSG"
 fi
 
 # --- Сброс state раз в сутки (00:00–00:06) — чистит устаревшие маркеры ---

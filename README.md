@@ -49,7 +49,7 @@ Restart=always
 В боте: «Мои серверы» → выбрать сервер → «Показать инструкцию». Команда вида:
 
 ```bash
-wget -qO- https://raw.githubusercontent.com/<owner>/telegram-server-bot/main/install.sh | bash -s -- --key <КЛЮЧ>
+wget -qO- https://raw.githubusercontent.com/Leonid1095/SYSadmins-BOT/main/install.sh | bash -s -- --key <КЛЮЧ>
 ```
 
 Агент ставится как `bot-agent.service`, слушает `:5000`, отвечает только на запросы с корректным `X-Secret-Key`.

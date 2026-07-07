@@ -242,7 +242,7 @@ async def show_instructions_callback(update: Update, context: ContextTypes.DEFAU
     user_data = load_users()[user_id]
     secret_key = user_data["servers"][server_name]['secret_key']
     
-    AGENT_URL = f"https://raw.githubusercontent.com/{context.bot_data.get('repo_owner', 'Leonid1095')}/{context.bot_data.get('repo_name', 'telegram-server-bot')}/main/install.sh"
+    AGENT_URL = f"https://raw.githubusercontent.com/{context.bot_data.get('repo_owner', 'Leonid1095')}/{context.bot_data.get('repo_name', 'SYSadmins-BOT')}/main/install.sh"
     
     text = (
         f"📋 *Инструкция по установке агента для сервера «{escape_markdown(server_name)}»*\n\n"
@@ -553,7 +553,7 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
 
 async def post_init(application: Application):
     application.bot_data['repo_owner'] = 'Leonid1095'
-    application.bot_data['repo_name'] = 'telegram-server-bot'
+    application.bot_data['repo_name'] = 'SYSadmins-BOT'
     logger.info("Данные о репозитории загружены.")
 
 def main():

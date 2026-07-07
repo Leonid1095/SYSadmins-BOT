@@ -38,3 +38,12 @@
 #   "https://uwow-guide.online"
 #   "https://plgames-voice.ru"
 # )
+
+# --- Каналы уведомлений (кроме Telegram) ---
+# Алерты уходят во ВСЕ настроенные каналы. Telegram работает из config.py.
+# ntfy — self-hosted push, доставляет даже когда Telegram недоступен/заблокирован:
+# NTFY_URL="http://127.0.0.1:2586"
+# NTFY_TOPIC="server-alerts"
+# NTFY_TOKEN=""                       # если ntfy закрыт авторизацией
+# Generic webhook (на будущее — интеграции/SaaS), получает plain-text телом:
+# WEBHOOK_URL="https://example.com/hook"

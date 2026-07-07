@@ -5,7 +5,7 @@ set -e
 
 # --- Переменные ---
 # URL вашего agent.py на GitHub. Убедитесь, что он верный.
-AGENT_RAW_URL="https://raw.githubusercontent.com/Leonid1095/telegram-server-bot/main/agent.py"
+AGENT_RAW_URL="https://raw.githubusercontent.com/Leonid1095/SYSadmins-BOT/main/agent.py"
 
 # Директория для установки
 INSTALL_DIR="/root/telegram-server-bot"
