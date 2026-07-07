@@ -68,6 +68,26 @@ wget -qO- https://raw.githubusercontent.com/Leonid1095/SYSadmins-BOT/main/instal
 
 Пороги и цели настраиваются в `monitor.local.conf` (см. `monitor.local.conf.example`).
 
+## Мониторинг нескольких серверов (Вариант A)
+
+На каждом дополнительном сервере выполните под root одну команду — она поставит
+`monitor.sh` в `/opt/server-monitor` и добавит cron `*/5`:
+
+```bash
+wget -qO- https://raw.githubusercontent.com/Leonid1095/SYSadmins-BOT/main/install-monitor.sh \
+  | sudo bash -s -- --token <ТОКЕН> --owner <ВАШ_TG_ID>
+```
+
+С резервным каналом **ntfy** (доставка, когда Telegram недоступен):
+
+```bash
+wget -qO- https://raw.githubusercontent.com/Leonid1095/SYSadmins-BOT/main/install-monitor.sh \
+  | sudo bash -s -- --token <ТОКЕН> --owner <ID> --ntfy-url http://<ntfy> --ntfy-topic server-alerts
+```
+
+Каждый сервер мониторит себя целиком (Docker/сервисы/SSL/нагрузка) и шлёт алерты во все
+настроенные каналы. Пороги и эндпоинты — в `/opt/server-monitor/monitor.local.conf`.
+
 ## Безопасность
 
 - Токен и данные пользователей — только в `.gitignore`-файлах, не в репозитории.

@@ -107,8 +107,10 @@ clear_mark() {
 ALERTS=()
 add_alert() { ALERTS+=("$1"); }
 
-# --- Также запустить удалённый мониторинг серверов других пользователей ---
-python3 "$SCRIPT_DIR/monitor_remote.py" 2>/dev/null &
+# --- Удалённый мониторинг чужих серверов — только на центральном сервере (где есть файл) ---
+if [ -f "$SCRIPT_DIR/monitor_remote.py" ]; then
+    python3 "$SCRIPT_DIR/monitor_remote.py" 2>/dev/null &
+fi
 
 # --- 1. ДИСК (/) ---
 DISK_PERCENT=$(df / | awk 'NR==2{gsub("%","",$5); print $5}')
