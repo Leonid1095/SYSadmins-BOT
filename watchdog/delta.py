@@ -1,0 +1,247 @@
+#!/usr/bin/env python3
+"""Сравнение снимков: что именно изменилось со времени прошлого запуска.
+
+Это единственное место, где решается, что считать событием. Модель просыпается
+только если здесь что-то нашлось, поэтому цена ошибки несимметрична: лишнее
+событие стоит токенов и доверия к уведомлениям, пропущенное — стоит поломки.
+
+Два правила против шума, оба выстраданы практикой monitor.sh:
+
+* Полосы вместо чисел. Событие рождает переход ok→warn→crit, а не каждый
+  изменившийся процент. Диск, третьи сутки стоящий на 81%, молчит.
+* Гистерезис. Чтобы выйти из полосы вниз, значение должно отойти от порога на
+  запас. Иначе диск, дышащий вокруг 80%, будил бы модель каждые пять минут.
+
+Первый запуск ничего не сообщает: он лишь запоминает базу. Иначе установка
+сторожа обернулась бы залпом из всего, что накопилось за годы.
+"""
+
+import json
+import os
+import re
+import sys
+from datetime import datetime, timezone
+
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+LOCAL_CONF = os.path.join(BASE_DIR, "monitor.local.conf")
+STATE_DIR = os.environ.get("WATCHDOG_STATE_DIR", "/var/lib/watchdog")
+STATE_FILE = os.path.join(STATE_DIR, "state.json")
+
+# Пороги. «Растущие» — чем больше, тем хуже; для сертификатов наоборот.
+RISING = {
+    ("disk", "pct"): (80, 90),
+    ("memory", "used_pct"): (90, 95),
+    ("memory", "swap_pct"): (80, 95),
+    ("cpu", "load_per_core_pct"): (150, 250),
+    ("temperature", "cpu_c"): (80, 90),
+}
+CERT_DAYS = (30, 10)   # warn / crit — предупредить, пока продление ещё возможно
+DEADBAND = 3           # запас на выход из полосы вниз
+
+SEVERITY_ORDER = {"ok": 0, "resolved": 0, "info": 1, "warn": 2, "crit": 3}
+
+
+# --- Полосы -----------------------------------------------------------------
+
+def rising_band(value, warn, crit, previous):
+    """Полоса для «чем больше, тем хуже», с запасом на возврат вниз."""
+    if value >= crit:
+        return "crit"
+    if value >= warn:
+        band = "warn"
+    else:
+        band = "ok"
+    # Спуск требует уйти ниже порога на DEADBAND, подъём — нет.
+    if previous == "crit" and value > crit - DEADBAND:
+        return "crit"
+    if previous in ("crit", "warn") and band == "ok" and value > warn - DEADBAND:
+        return "warn"
+    return band
+
+
+def falling_band(days, warn, crit):
+    """Полоса для сертификатов: меньше дней — хуже. Гистерезис не нужен,
+    остаток убывает на день в сутки и дрожать у порога не может."""
+    if days <= crit:
+        return "crit"
+    if days <= warn:
+        return "warn"
+    return "ok"
+
+
+# --- Конфигурация исключений ------------------------------------------------
+
+def _conf_list(name):
+    """Читает NAME="a b c" из monitor.local.conf, не исполняя файл."""
+    try:
+        with open(LOCAL_CONF, encoding="utf-8") as f:
+            text = f.read()
+    except OSError:
+        return set()
+    match = re.search(rf'^\s*{name}="([^"]*)"', text, re.MULTILINE)
+    return set(match.group(1).split()) if match else set()
+
+
+def ignored():
+    """Контейнеры и юниты, чья остановка — норма, а не авария.
+
+    Переиспользуем те же списки, что и monitor.sh: если комнаты civ4col гасятся
+    сами через 30 минут, сторож не должен считать это происшествием."""
+    return {
+        "docker": _conf_list("DOCKER_IGNORE"),
+        "systemd": _conf_list("SERVICES_IGNORE"),
+    }
+
+
+# --- Сравнение --------------------------------------------------------------
+
+class DeltaBuilder:
+    def __init__(self, previous_bands):
+        self.previous_bands = previous_bands or {}
+        self.bands = {}
+        self.events = []
+
+    def _emit(self, kind, key, was, now, detail):
+        """Событие рождается только при смене полосы."""
+        if was == now:
+            return
+        severity = "resolved" if SEVERITY_ORDER[now] < SEVERITY_ORDER.get(was, 0) else now
+        self.events.append({
+            "kind": kind, "key": key,
+            "from": was, "to": now,
+            "severity": severity, "detail": detail,
+        })
+
+    def numeric(self, facts):
+        for (section, field), (warn, crit) in RISING.items():
+            data = facts.get(section)
+            if not isinstance(data, dict):
+                continue
+            # disk вложен на уровень глубже: {"root": {...}, "hdd": {...}}
+            entries = data.items() if field not in data else [(section, data)]
+            for name, values in entries:
+                if not isinstance(values, dict) or field not in values:
+                    continue
+                value = values[field]
+                slot = f"{section}.{name}.{field}"
+                was = self.previous_bands.get(slot, "ok")
+                now = rising_band(value, warn, crit, was)
+                self.bands[slot] = now
+                self._emit(section, name, was, now, f"{field}={value}")
+
+    def certificates(self, facts):
+        for url, entry in (facts.get("endpoints") or {}).items():
+            days = entry.get("cert_days")
+            if days is None:
+                continue
+            slot = f"cert.{url}"
+            was = self.previous_bands.get(slot, "ok")
+            now = falling_band(days, *CERT_DAYS)
+            self.bands[slot] = now
+            self._emit("cert", url, was, now, f"осталось дней: {days}")
+
+    def http(self, facts):
+        for url, entry in (facts.get("endpoints") or {}).items():
+            code = entry.get("http")
+            slot = f"http.{url}"
+            was = self.previous_bands.get(slot, "ok")
+            now = "ok" if code is not None and 200 <= code < 400 else "crit"
+            self.bands[slot] = now
+            self._emit("http", url, was, now, f"HTTP {code}" if code else "нет ответа")
+
+    def smart(self, facts):
+        for dev, verdict in (facts.get("smart") or {}).items():
+            slot = f"smart.{dev}"
+            was = self.previous_bands.get(slot, "ok")
+            now = "ok" if verdict.upper() in ("PASSED", "OK") else "crit"
+            self.bands[slot] = now
+            self._emit("smart", dev, was, now, f"SMART: {verdict}")
+
+    def lists(self, previous_facts, facts, skip):
+        """Списки сравниваем поимённо: замена одной поломки другой не должна
+        пройти молча только потому, что счётчик не изменился."""
+        sources = [
+            ("systemd", "failed", "crit", skip["systemd"]),
+            ("docker", "stopped", "warn", skip["docker"]),
+            ("docker", "unhealthy", "crit", skip["docker"]),
+            ("docker", "restarting", "crit", skip["docker"]),
+        ]
+        for section, field, severity, ignore in sources:
+            was = set((previous_facts.get(section) or {}).get(field) or [])
+            now = set((facts.get(section) or {}).get(field) or [])
+            was, now = was - ignore, now - ignore
+            for item in sorted(now - was):
+                self.events.append({
+                    "kind": section, "key": item, "from": "ok", "to": severity,
+                    "severity": severity, "detail": f"{field}",
+                })
+            for item in sorted(was - now):
+                self.events.append({
+                    "kind": section, "key": item, "from": severity, "to": "ok",
+                    "severity": "resolved", "detail": f"больше не {field}",
+                })
+
+
+def load_state():
+    try:
+        with open(STATE_FILE, encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def save_state(state):
+    os.makedirs(STATE_DIR, mode=0o700, exist_ok=True)
+    tmp = STATE_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(state, f, ensure_ascii=False, indent=2, sort_keys=True)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, STATE_FILE)
+    os.chmod(STATE_FILE, 0o600)
+
+
+def compare(snapshot, state):
+    facts = snapshot.get("facts", {})
+    skip = ignored()
+
+    if state is None:
+        # Первый запуск: запоминаем базу и молчим.
+        builder = DeltaBuilder({})
+        builder.numeric(facts)
+        builder.certificates(facts)
+        builder.http(facts)
+        builder.smart(facts)
+        return [], builder.bands, True
+
+    builder = DeltaBuilder(state.get("bands"))
+    builder.numeric(facts)
+    builder.certificates(facts)
+    builder.http(facts)
+    builder.smart(facts)
+    builder.lists(state.get("facts", {}), facts, skip)
+    return builder.events, builder.bands, False
+
+
+def main():
+    snapshot = json.load(sys.stdin)
+    state = load_state()
+    events, bands, baseline = compare(snapshot, state)
+
+    save_state({
+        "updated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "bands": bands,
+        "facts": snapshot.get("facts", {}),
+    })
+
+    events.sort(key=lambda e: -SEVERITY_ORDER.get(e["severity"], 0))
+    json.dump({
+        "baseline": baseline,
+        "events": events,
+        "snapshot": snapshot,
+    }, sys.stdout, ensure_ascii=False, indent=2)
+    sys.stdout.write("\n")
+
+
+if __name__ == "__main__":
+    main()
