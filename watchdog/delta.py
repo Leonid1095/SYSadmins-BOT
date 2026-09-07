@@ -20,6 +20,7 @@ import json
 import os
 import re
 import sys
+import time
 from datetime import datetime, timezone
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -37,6 +38,14 @@ RISING = {
 }
 CERT_DAYS = (30, 10)   # warn / crit — предупредить, пока продление ещё возможно
 DEADBAND = 3           # запас на выход из полосы вниз
+
+# Дребезг: объект, который циклит crit→resolved→crit, будил бы модель каждые
+# пять минут и выедал подписку, ничего не сообщая сверх первого раза. После
+# FLAP_LIMIT смен полосы за FLAP_WINDOW он замолкает на FLAP_MUTE, а владелец
+# получает одно сообщение — про сам дребезг, который и есть настоящая новость.
+FLAP_WINDOW = 30 * 60
+FLAP_LIMIT = 4
+FLAP_MUTE = 60 * 60
 
 SEVERITY_ORDER = {"ok": 0, "resolved": 0, "info": 1, "warn": 2, "crit": 3}
 
@@ -96,15 +105,51 @@ def ignored():
 # --- Сравнение --------------------------------------------------------------
 
 class DeltaBuilder:
-    def __init__(self, previous_bands):
+    def __init__(self, previous_bands, flap_state=None, now_ts=None):
         self.previous_bands = previous_bands or {}
+        self.flap = {k: dict(v) for k, v in (flap_state or {}).items()}
+        self.now_ts = now_ts if now_ts is not None else time.time()
         self.bands = {}
         self.events = []
+
+    def _flapping(self, slot):
+        """Регистрирует смену полосы и отвечает, замолчал ли объект.
+
+        Возвращает "muted", если объект уже признан дребезжащим и молчит;
+        "started", если признан прямо сейчас; None, если всё в порядке.
+        """
+        record = self.flap.setdefault(slot, {"changes": [], "muted_until": 0})
+
+        if self.now_ts < record["muted_until"]:
+            return "muted"
+
+        window_start = self.now_ts - FLAP_WINDOW
+        record["changes"] = [t for t in record["changes"] if t >= window_start]
+        record["changes"].append(self.now_ts)
+
+        if len(record["changes"]) >= FLAP_LIMIT:
+            record["muted_until"] = self.now_ts + FLAP_MUTE
+            record["changes"] = []
+            return "started"
+        return None
 
     def _emit(self, kind, key, was, now, detail):
         """Событие рождается только при смене полосы."""
         if was == now:
             return
+
+        state = self._flapping(f"{kind}.{key}")
+        if state == "muted":
+            return
+        if state == "started":
+            self.events.append({
+                "kind": kind, "key": key, "from": was, "to": "flapping",
+                "severity": "warn", "flapping": True,
+                "detail": f"состояние скачет ({detail}); дальнейшие смены "
+                          f"на {FLAP_MUTE // 60} мин не сообщаются",
+            })
+            return
+
         severity = "resolved" if SEVERITY_ORDER[now] < SEVERITY_ORDER.get(was, 0) else now
         self.events.append({
             "kind": kind, "key": key,
@@ -171,15 +216,9 @@ class DeltaBuilder:
             now = set((facts.get(section) or {}).get(field) or [])
             was, now = was - ignore, now - ignore
             for item in sorted(now - was):
-                self.events.append({
-                    "kind": section, "key": item, "from": "ok", "to": severity,
-                    "severity": severity, "detail": f"{field}",
-                })
+                self._emit(section, item, "ok", severity, field)
             for item in sorted(was - now):
-                self.events.append({
-                    "kind": section, "key": item, "from": severity, "to": "ok",
-                    "severity": "resolved", "detail": f"больше не {field}",
-                })
+                self._emit(section, item, severity, "ok", f"больше не {field}")
 
 
 def load_state():
@@ -207,30 +246,31 @@ def compare(snapshot, state):
 
     if state is None:
         # Первый запуск: запоминаем базу и молчим.
-        builder = DeltaBuilder({})
+        builder = DeltaBuilder({}, None)
         builder.numeric(facts)
         builder.certificates(facts)
         builder.http(facts)
         builder.smart(facts)
-        return [], builder.bands, True
+        return [], builder.bands, True, builder.flap
 
-    builder = DeltaBuilder(state.get("bands"))
+    builder = DeltaBuilder(state.get("bands"), state.get("flap"))
     builder.numeric(facts)
     builder.certificates(facts)
     builder.http(facts)
     builder.smart(facts)
     builder.lists(state.get("facts", {}), facts, skip)
-    return builder.events, builder.bands, False
+    return builder.events, builder.bands, False, builder.flap
 
 
 def main():
     snapshot = json.load(sys.stdin)
     state = load_state()
-    events, bands, baseline = compare(snapshot, state)
+    events, bands, baseline, flap = compare(snapshot, state)
 
     save_state({
         "updated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "bands": bands,
+        "flap": flap,
         "facts": snapshot.get("facts", {}),
     })
 

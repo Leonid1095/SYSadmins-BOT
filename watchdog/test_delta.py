@@ -154,6 +154,64 @@ class DeltaTest(unittest.TestCase):
         events = self.events_of(snapshot(smart="FAILED"))
         self.assertEqual(events[0]["severity"], "crit")
 
+    # --- Дребезг ------------------------------------------------------------
+
+    def test_дребезжащий_объект_замолкает(self):
+        """Контейнер, циклящий stopped→running, будил бы модель каждые пять
+        минут. После четвёртой смены он сообщает о самом дребезге и молчит."""
+        self.run_delta(snapshot())
+        severities = []
+        for i in range(6):
+            stopped = ["flappy"] if i % 2 == 0 else []
+            events = self.events_of(snapshot(stopped=stopped))
+            severities.append([(e["severity"], e.get("flapping", False)) for e in events])
+
+        # Первые три смены — обычные события.
+        self.assertEqual(severities[0], [("warn", False)])
+        self.assertEqual(severities[1], [("resolved", False)])
+        self.assertEqual(severities[2], [("warn", False)])
+        # Четвёртая объявляет дребезг...
+        self.assertEqual(severities[3], [("warn", True)])
+        # ...после чего объект молчит.
+        self.assertEqual(severities[4], [])
+        self.assertEqual(severities[5], [])
+
+    def test_событие_про_дребезг_объясняет_себя(self):
+        self.run_delta(snapshot())
+        event = None
+        for i in range(4):
+            events = self.events_of(snapshot(stopped=["flappy"] if i % 2 == 0 else []))
+            if events and events[0].get("flapping"):
+                event = events[0]
+        self.assertIsNotNone(event)
+        self.assertEqual(event["to"], "flapping")
+        self.assertIn("скачет", event["detail"])
+
+    def test_после_истечения_тишины_события_возвращаются(self):
+        """Молчание временное: объект, переставший дребезжать, снова слышен."""
+        self.run_delta(snapshot())
+        for i in range(4):
+            self.events_of(snapshot(stopped=["flappy"] if i % 2 == 0 else []))
+        self.assertEqual(self.events_of(snapshot(stopped=["flappy"])), [])
+
+        state_path = os.path.join(self.state_dir, "state.json")
+        with open(state_path, encoding="utf-8") as f:
+            state = json.load(f)
+        state["flap"]["docker.flappy"]["muted_until"] = 0   # тишина истекла
+        with open(state_path, "w", encoding="utf-8") as f:
+            json.dump(state, f)
+
+        events = self.events_of(snapshot(stopped=[]))
+        self.assertEqual([e["severity"] for e in events], ["resolved"])
+
+    def test_дребезг_одного_не_глушит_другого(self):
+        """Замолкает конкретный объект, а не весь класс событий."""
+        self.run_delta(snapshot())
+        for i in range(4):
+            self.events_of(snapshot(stopped=["flappy"] if i % 2 == 0 else []))
+        events = self.events_of(snapshot(stopped=["flappy", "другой"]))
+        self.assertEqual([(e["key"], e["severity"]) for e in events], [("другой", "warn")])
+
     def test_события_идут_от_тяжёлых_к_лёгким(self):
         self.run_delta(snapshot())
         events = self.events_of(snapshot(disk_pct=85, failed=["x.service"]))

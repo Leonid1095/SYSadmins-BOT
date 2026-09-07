@@ -1,0 +1,15 @@
+[Unit]
+Description=Запуск сторожа раз в пять минут
+Documentation=file:/home/plg/telegram-server-bot/docs/watchdog-roadmap.md
+
+[Timer]
+OnBootSec=3min
+OnUnitActiveSec=5min
+# Разброс, чтобы сторож не сходился в одну секунду с monitor.sh из root-крона:
+# два процесса, одновременно опрашивающих docker и smartctl, мешают друг другу.
+RandomizedDelaySec=45
+AccuracySec=15s
+Persistent=false
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,40 @@
+[Unit]
+Description=Сторож сервера: детекторы, разбор дельты, уведомления владельцу
+Documentation=file:/home/plg/telegram-server-bot/docs/watchdog-roadmap.md
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=plg
+Group=plg
+WorkingDirectory=/home/plg/telegram-server-bot
+ExecStart=/home/plg/telegram-server-bot/watchdog/run.sh
+
+# Секреты отдаёт systemd — файл читает root, процессу достаются только значения.
+EnvironmentFile=/etc/telegram-server-bot.env
+# Telegram и Anthropic у провайдера недоступны напрямую; свои домены сборщик
+# проверяет мимо прокси (см. collect.py).
+Environment="HTTPS_PROXY=http://127.0.0.1:18443"
+Environment="HTTP_PROXY=http://127.0.0.1:18443"
+Environment="WATCHDOG_STATE_DIR=/var/lib/watchdog"
+
+StateDirectory=watchdog
+StateDirectoryMode=0700
+
+# Разбор с моделью занимает около минуты; таймер ходит раз в пять, так что
+# запас есть. Но зависнуть навсегда не должен.
+TimeoutStartSec=600
+
+# Усиление намеренно неполное: сторож вызывает sudo для трёх команд на чтение
+# и для исполнителя починок, поэтому NoNewPrivileges и RestrictSUIDSGID здесь
+# включать нельзя — они сломают sudo, а не злоумышленника.
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+ProtectKernelModules=true
+RestrictRealtime=true
+LockPersonality=true
+
+[Install]
+WantedBy=multi-user.target

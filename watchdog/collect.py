@@ -200,13 +200,17 @@ class Collector:
         targets = self._configured_endpoints()
         if not targets:
             return None
+        # Прокси обходим намеренно. Юниту он задан ради Telegram и модели, но
+        # свои же домены надо проверять так, как их видит обычный посетитель, —
+        # иначе сторож будет докладывать о доступности чужого выходного узла.
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
         out = {}
         for url in targets:
             entry = {}
             try:
                 req = urllib.request.Request(url, method="GET",
                                              headers={"User-Agent": "watchdog/1.0"})
-                with urllib.request.urlopen(req, timeout=NET_TIMEOUT) as resp:
+                with opener.open(req, timeout=NET_TIMEOUT) as resp:
                     entry["http"] = resp.status
             except urllib.error.HTTPError as exc:
                 entry["http"] = exc.code
