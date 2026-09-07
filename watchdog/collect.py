@@ -32,6 +32,19 @@ BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 LOCAL_CONF = os.path.join(BASE_DIR, "monitor.local.conf")
 
 
+def _run_priv(cmd, timeout=CMD_TIMEOUT):
+    """Как _run, но для трёх команд, которым нужен root.
+
+    Сборщик работает под plg — тем же пользователем, что и аналитик, потому что
+    подписка Max привязана к его credentials. Ради smartctl поднимать весь
+    сборщик до root не станем: узкие правила sudoers дешевле, чем root-процесс,
+    ходящий в сеть за сертификатами.
+    """
+    if os.geteuid() != 0:
+        cmd = ["sudo", "-n", *cmd]
+    return _run(cmd, timeout)
+
+
 def _run(cmd, timeout=CMD_TIMEOUT):
     """Запускает команду и возвращает stdout. Любой сбой — это None, не исключение."""
     try:
@@ -172,7 +185,9 @@ class Collector:
             if len(parts) != 2 or parts[1] != "disk":
                 continue
             dev = f"/dev/{parts[0]}"
-            out = _run(["smartctl", "-H", dev], timeout=CMD_TIMEOUT)
+            if not re.fullmatch(r"/dev/[a-z0-9]{1,16}", dev):
+                continue  # имя уходит в привилегированный вызов — форму проверяем заранее
+            out = _run_priv(["/usr/sbin/smartctl", "-H", dev], timeout=CMD_TIMEOUT)
             if out is None:
                 continue
             match = re.search(r"(?:overall-health self-assessment test result|SMART Health Status):\s*(\S+)", out)
@@ -237,14 +252,14 @@ class Collector:
     def security(self):
         """Активные баны — косвенный признак, что машину щупают активнее обычного."""
         out = {}
-        crowdsec = _run(["cscli", "decisions", "list", "-o", "json"])
+        crowdsec = _run_priv(["/usr/bin/cscli", "decisions", "list", "-o", "json"])
         if crowdsec is not None:
             try:
                 decisions = json.loads(crowdsec) or []
                 out["crowdsec_bans"] = len(decisions)
             except json.JSONDecodeError:
                 pass
-        f2b = _run(["fail2ban-client", "status"])
+        f2b = _run_priv(["/usr/bin/fail2ban-client", "status"])
         if f2b is not None:
             match = re.search(r"Jail list:\s*(.*)", f2b)
             if match:

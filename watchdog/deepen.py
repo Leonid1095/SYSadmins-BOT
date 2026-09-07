@@ -109,7 +109,10 @@ def _http_context(url):
 def _smart_context(dev):
     if not re.fullmatch(r"/dev/[a-z0-9]{1,16}", dev):
         return None
-    return {f"smart-{os.path.basename(dev)}.txt": _capture(["smartctl", "-a", "--", dev])}
+    cmd = ["/usr/sbin/smartctl", "-a", dev]
+    if os.geteuid() != 0:
+        cmd = ["sudo", "-n", *cmd]
+    return {f"smart-{os.path.basename(dev)}.txt": _capture(cmd)}
 
 
 GATHERERS = {

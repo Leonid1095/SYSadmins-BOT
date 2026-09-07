@@ -3,25 +3,32 @@
 import logging
 import json
 import os
+import sys
 import uuid
 import requests
 import re
 import asyncio
+import html
 import ipaddress
 import tempfile
 from functools import wraps
-from telegram import Update
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
+    ApplicationHandlerStop,
     CommandHandler,
     ContextTypes,
     ConversationHandler,
     CallbackQueryHandler,
     MessageHandler,
+    TypeHandler,
     filters,
 )
 
 import config
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "watchdog"))
+import incidents  # noqa: E402  — мост между кнопками сторожа и root-исполнителем
 from keyboards import (
     get_main_menu_keyboard, get_server_list_keyboard,
     get_server_management_keyboard, get_delete_confirm_keyboard,
@@ -215,7 +222,9 @@ async def select_server_callback(update: Update, context: ContextTypes.DEFAULT_T
     text = (
         f"⚙️ *Управление сервером «{escape_markdown(server_name)}»*\n\n"
         f"**IP\\-адрес:** `{escape_markdown(server_data['server_ip'])}`\n"
-        f"**Ключ:** `{escape_markdown(server_data['secret_key'])}`"
+        # Ключ агента в чат не выводим: сообщение осело бы в истории Telegram
+        # навсегда. Его показывает только инструкция по установке, по запросу.
+        f"**Ключ:** `{escape_markdown(server_data['secret_key'][:4])}…` \\(скрыт\\)"
     )
     await query.edit_message_text(text, reply_markup=get_server_management_keyboard(server_name), parse_mode='MarkdownV2')
 
@@ -551,6 +560,103 @@ async def cancel_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE
     await start_command(update, context)
     return ConversationHandler.END
 
+# --- Сторож: доступ и кнопки ------------------------------------------------
+
+async def owner_only(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Пропускает дальше только владельца.
+
+    Стоит в группе -1, то есть срабатывает раньше всех остальных обработчиков.
+    Посторонним не отвечаем вовсе: любой ответ подтвердил бы, что бот живой и
+    чем-то управляет. Раньше бот пускал кого угодно регистрировать свои серверы —
+    для админского бота с кнопками действий это недопустимо.
+    """
+    user = update.effective_user
+    if user is not None and str(user.id) == str(config.OWNER_ID):
+        return
+    logger.warning("Отброшен update от постороннего: id=%s",
+                   user.id if user else "неизвестен")
+    raise ApplicationHandlerStop
+
+
+def _remedy_keyboard(incident_id: str, index: int) -> InlineKeyboardMarkup:
+    """Подтверждение перед реальным действием: кнопку легко задеть случайно."""
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("✅ Да, выполнить", callback_data=f"wdok:{incident_id}:{index}"),
+        InlineKeyboardButton("↩️ Отмена", callback_data=f"wdno:{incident_id}:{index}"),
+    ]])
+
+
+def _parse_callback(data: str):
+    parts = data.split(":", 2)
+    if len(parts) != 3 or not parts[2].isdigit():
+        raise incidents.IncidentError("Не удалось разобрать нажатие.")
+    return parts[1], int(parts[2])
+
+
+async def watchdog_option(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Владелец выбрал вариант. Действие берём из вердикта, а не из нажатия."""
+    query = update.callback_query
+    await query.answer()
+    try:
+        incident_id, index = _parse_callback(query.data)
+        result, chosen = incidents.option(incident_id, index)
+    except incidents.IncidentError as exc:
+        await query.edit_message_text(f"⚠️ {escape_markdown(str(exc))}",
+                                      parse_mode='MarkdownV2')
+        return
+
+    if chosen["action"] == "nothing":
+        incidents.record_choice(incident_id, {"choice": "nothing", "by": query.from_user.id})
+        await query.edit_message_text(
+            f"{query.message.text_html}\n\n☑️ <i>Принято к сведению, действий не предпринято.</i>",
+            parse_mode='HTML')
+        return
+
+    target = f" → <code>{chosen['target']}</code>" if chosen.get("target") else ""
+    await query.edit_message_text(
+        f"{query.message.text_html}\n\n❓ <b>{chosen['label']}</b>{target}\n"
+        f"<i>{chosen['why']}</i>\n\nВыполнить?",
+        parse_mode='HTML', reply_markup=_remedy_keyboard(incident_id, index))
+
+
+async def watchdog_execute(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Подтверждено. Зовём исполнителя — он проверит заявку заново."""
+    query = update.callback_query
+    await query.answer("Выполняю…")
+    try:
+        incident_id, index = _parse_callback(query.data)
+        result, chosen = incidents.option(incident_id, index)
+    except incidents.IncidentError as exc:
+        await query.edit_message_text(f"⚠️ {exc}", parse_mode=None)
+        return
+
+    outcome = await asyncio.to_thread(
+        incidents.run_remedy, chosen["action"], chosen.get("target"))
+    incidents.record_choice(incident_id, {
+        "choice": chosen["action"], "target": chosen.get("target"),
+        "ok": outcome.get("ok"), "by": query.from_user.id,
+    })
+
+    mark = "✅" if outcome.get("ok") else "⛔️"
+    body = html.escape(str(outcome.get("output", ""))[:900])
+    await query.edit_message_text(
+        f"{query.message.text_html}\n\n{mark} <b>{html.escape(chosen['label'])}</b>\n"
+        f"<pre>{body}</pre>", parse_mode='HTML')
+
+
+async def watchdog_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer("Отменено")
+    try:
+        incident_id, _ = _parse_callback(query.data)
+        incidents.record_choice(incident_id, {"choice": "cancelled", "by": query.from_user.id})
+    except incidents.IncidentError:
+        pass
+    await query.edit_message_text(
+        f"{query.message.text_html}\n\n↩️ <i>Отменено, ничего не выполнено.</i>",
+        parse_mode='HTML')
+
+
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     logger.error(f"Exception while handling an update:", exc_info=context.error)
 
@@ -564,8 +670,15 @@ def main():
         logger.error("TELEGRAM_TOKEN не установлен в config.py")
         return
     
+    if not config.OWNER_ID:
+        logger.error("OWNER_ID не задан — бот не знает, кого пускать, и не стартует")
+        return
+
     application = Application.builder().token(config.TELEGRAM_TOKEN).post_init(post_init).build()
     application.add_error_handler(error_handler)
+
+    # Группа -1: отсечка посторонних до всех остальных обработчиков.
+    application.add_handler(TypeHandler(Update, owner_only), group=-1)
     
     add_conv = ConversationHandler(
         entry_points=[CallbackQueryHandler(addserver_start, pattern='^add_server_start$')],
@@ -594,6 +707,11 @@ def main():
     application.add_handler(CallbackQueryHandler(show_instructions_callback, pattern=r'^show_instructions_'))
     application.add_handler(CallbackQueryHandler(deleteserver_start, pattern=r'^delete_server_'))
     application.add_handler(CallbackQueryHandler(confirm_delete_callback, pattern=r'^confirm_delete_'))
+
+    # Сторож: выбор варианта, подтверждение, отмена.
+    application.add_handler(CallbackQueryHandler(watchdog_option, pattern=r'^wd:'))
+    application.add_handler(CallbackQueryHandler(watchdog_execute, pattern=r'^wdok:'))
+    application.add_handler(CallbackQueryHandler(watchdog_cancel, pattern=r'^wdno:'))
 
     application.add_handler(add_conv)
 
