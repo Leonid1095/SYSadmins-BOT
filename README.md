@@ -10,6 +10,7 @@
 | `agent.py` | на каждом наблюдаемом сервере | Flask/Gunicorn API `:5000/status` — отдаёт метрики (CPU/RAM/диск/GPU) |
 | `monitor.sh` | центральный сервер, cron `*/5` | Проактивный мониторинг **локального** сервера и всех его проектов (Docker, systemd, HTTP, SMART, SSL). Алерты — владельцу |
 | `monitor_remote.py` | вызывается из `monitor.sh` | Проверяет серверы **других** пользователей через их агентов |
+| `watchdog/` | центральный сервер, systemd-таймер `*/5` | Сторож: замечает изменения, разбирает их моделью и присылает варианты кнопками |
 
 Данные: `users.json` (серверы пользователей), `monitor_subscribers.json` (подписки/пороги) — оба в `.gitignore`.
 
@@ -19,11 +20,21 @@
 git clone <repo> && cd telegram-server-bot
 python3 -m venv venv
 venv/bin/pip install -r requirements.txt
-cp .env.example .env            # или отредактируйте config.py
-# впишите TELEGRAM_TOKEN (новый, от @BotFather) и OWNER_ID
 ```
 
-`config.py` (в `.gitignore`) — единый источник токена и `OWNER_ID` для всех компонентов.
+Секреты живут **только** в env-файле вне репозитория:
+
+```bash
+sudo install -m 600 -o root -g root /dev/null /etc/telegram-server-bot.env
+sudo tee /etc/telegram-server-bot.env >/dev/null <<'EOF'
+TELEGRAM_TOKEN=<токен от @BotFather>
+OWNER_ID=<ваш Telegram id>
+EOF
+```
+
+В `config.py` и в репозитории секретов нет и быть не должно: `config.py` только
+читает окружение, а файл — лишь если он доступен (то есть под root, для
+`monitor.sh`). Боту переменные отдаёт systemd, не открывая процессу сам файл.
 
 ### systemd-сервис бота
 
@@ -32,9 +43,13 @@ cp .env.example .env            # или отредактируйте config.py
 [Service]
 User=plg
 WorkingDirectory=/home/plg/telegram-server-bot
+EnvironmentFile=/etc/telegram-server-bot.env
 ExecStart=/home/plg/telegram-server-bot/venv/bin/python bot.py
 Restart=always
 ```
+
+Бот отвечает только владельцу (`OWNER_ID`); остальные update'ы отбрасываются
+молча. Без `OWNER_ID` он не стартует.
 
 ### cron для проактивного монитора
 
@@ -88,8 +103,51 @@ wget -qO- https://raw.githubusercontent.com/Leonid1095/SYSadmins-BOT/main/instal
 Каждый сервер мониторит себя целиком (Docker/сервисы/SSL/нагрузка) и шлёт алерты во все
 настроенные каналы. Пороги и эндпоинты — в `/opt/server-monitor/monitor.local.conf`.
 
+## Сторож (`watchdog/`)
+
+`monitor.sh` умеет заметить поломку, но не умеет объяснить. Сторож закрывает
+именно это: он присылает разбор и варианты действий кнопками.
+
+```bash
+venv/bin/pip install claude-agent-sdk
+sudo ./watchdog/install.sh
+```
+
+Как устроено:
+
+```
+таймер */5 → collect (детекторы) → delta (что изменилось)
+           → [дельты нет? выход, ноль токенов]
+           → deepen (добор контекста) → analyst (модель) → уведомление с кнопками
+```
+
+Модель просыпается **только на смене состояния**. Диск, третьи сутки стоящий на
+81%, молчит; ушедший с 80% на 91% — будит. В спокойный день сторож не тратит
+ни токена и не шлёт ни сообщения.
+
+Работает на подписке Claude (Agent SDK), API-ключ не нужен. Модель по умолчанию
+`claude-sonnet-5` — меняется переменной `WATCHDOG_MODEL` в юните.
+
+Границы: у аналитика нет `Bash`, `Write` и сети — только чтение файлов каталога
+инцидента. Действия он не сочиняет, а выбирает из каталога (`watchdog/catalog.py`)
+по идентификатору; команду собирает код. Ничего не выполняется без нажатия
+владельцем, и каждое исполнение проходит через root-хелпер, который проверяет
+заявку заново. Подробности и обоснования — в `docs/watchdog-roadmap.md`.
+
+| Где смотреть | Что |
+|---|---|
+| `journalctl -u watchdog.service` | ход проверок |
+| `/var/lib/watchdog/incidents/` | факты, контекст и вердикт по каждому инциденту |
+| `/var/log/watchdog-remedy.log` | аудит починок, включая отклонённые |
+
+Тесты: `python3 watchdog/test_delta.py`, `python3 watchdog/test_catalog.py`,
+`venv/bin/python watchdog/test_bot_guard.py`.
+
 ## Безопасность
 
-- Токен и данные пользователей — только в `.gitignore`-файлах, не в репозитории.
+- Секреты — только в env-файле вне репозитория (0600 root), не в `config.py`.
+- Бот отвечает исключительно владельцу; посторонние update'ы отбрасываются.
 - Агент отклоняет запросы без верного ключа (constant-time сравнение).
 - Бот принимает только публичные IPv4 (защита от SSRF во внутреннюю сеть).
+- Сторож не исполняет ничего сам: модель предлагает, владелец подтверждает,
+  root-хелпер перепроверяет и ведёт аудит.

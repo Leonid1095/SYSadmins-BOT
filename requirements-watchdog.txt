@@ -1,0 +1,4 @@
+# Зависимости сторожа (watchdog/). Ставятся в тот же venv, что и бот.
+# Работает на подписке Claude — API-ключ не нужен, нужен установленный
+# и авторизованный claude CLI (см. docs/watchdog-roadmap.md).
+claude-agent-sdk==0.2.152
