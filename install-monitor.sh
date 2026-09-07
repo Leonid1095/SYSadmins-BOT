@@ -52,14 +52,23 @@ if ! curl -fsSL --connect-timeout 15 --max-time 60 --retry 2 \
 fi
 chmod 700 "$INSTALL_DIR/monitor.sh"
 
-# config.py с секретами (0600)
+# Секреты — в env-файл вне каталога установки (0600, root). В .py их не пишем:
+# так токен не попадёт ни в репозиторий, ни в бэкап каталога, ни в чей-то git add.
+ENV_FILE="/etc/server-monitor.env"
 umask 077
-cat > "$INSTALL_DIR/config.py" <<EOF
-import os
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "${TOKEN}")
-OWNER_ID = os.getenv("OWNER_ID", "${OWNER}")
-EOF
-chmod 600 "$INSTALL_DIR/config.py"
+: > "$ENV_FILE"
+chmod 600 "$ENV_FILE"
+chown root:root "$ENV_FILE"
+{
+    [ -n "$TOKEN" ] && echo "TELEGRAM_TOKEN=$TOKEN"
+    [ -n "$OWNER" ] && echo "OWNER_ID=$OWNER"
+} >> "$ENV_FILE"
+
+# Подчищаем наследие прежних установок: там токен лежал прямо в config.py.
+if [ -f "$INSTALL_DIR/config.py" ]; then
+    shred -u "$INSTALL_DIR/config.py" 2>/dev/null || rm -f "$INSTALL_DIR/config.py"
+    echo "INFO: старый config.py с секретом удалён — токен теперь в $ENV_FILE"
+fi
 
 # monitor.local.conf (создаём один раз, не затираем существующий)
 if [ ! -f "$INSTALL_DIR/monitor.local.conf" ]; then

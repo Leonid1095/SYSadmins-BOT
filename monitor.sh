@@ -8,9 +8,18 @@
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-# --- Секреты: единый источник — config.py (в .gitignore) ---
-BOT_TOKEN=$(cd "$SCRIPT_DIR" && python3 -c "import config; print(config.TELEGRAM_TOKEN)" 2>/dev/null)
-OWNER_ID=$(cd "$SCRIPT_DIR" && python3 -c "import config; print(config.OWNER_ID)" 2>/dev/null)
+# --- Секреты: env-файл вне репозитория (0600), первый читаемый из списка. ---
+# Токен НЕ хранится ни в репозитории, ни в config.py: только в env-файле.
+for _envf in "${BOT_ENV_FILE:-}" /etc/telegram-server-bot.env /etc/server-monitor.env; do
+    [ -n "$_envf" ] && [ -r "$_envf" ] && . "$_envf" && break
+done
+BOT_TOKEN="${TELEGRAM_TOKEN:-}"
+OWNER_ID="${OWNER_ID:-}"
+# Совместимость со старыми установками, где секреты лежали в config.py.
+if [ -z "$BOT_TOKEN" ] && [ -f "$SCRIPT_DIR/config.py" ]; then
+    BOT_TOKEN=$(cd "$SCRIPT_DIR" && python3 -c "import config; print(config.TELEGRAM_TOKEN)" 2>/dev/null)
+    OWNER_ID=$(cd "$SCRIPT_DIR" && python3 -c "import config; print(config.OWNER_ID)" 2>/dev/null)
+fi
 # Проверка «настроен хотя бы один канал» — ниже, после загрузки monitor.local.conf
 
 # Per-user, чтобы не конфликтовать по владельцу в sticky /tmp (root/plg запуски)
@@ -40,7 +49,10 @@ CRITICAL_SERVICES="nginx postgresql docker fail2ban ssh"
 # systemd-юниты, которые НЕ алертить как failed (частый безобидный шум), через пробел
 SERVICES_IGNORE="fwupd.service fwupd-refresh.service"
 # Контейнеры-исключения (одноразовые/намеренно остановленные), через пробел
-DOCKER_IGNORE=""
+# Комнаты Civ4Col поднимаются по заказу и гасятся сами через 30 мин без игроков —
+# остановленная комната это НОРМА, а не авария. Без исключения каждое автогашение давало
+# три алерта «Контейнер не запущен», и на их фоне терялись настоящие поломки.
+DOCKER_IGNORE="civ4col-pitboss civ4col-pitboss2 civ4col-pitboss3"
 # HTTP-эндпоинты для проверки доступности проектов, напр. ENDPOINTS=("https://site.ru" ...)
 ENDPOINTS=()
 

@@ -41,6 +41,9 @@ SERVER_NAME_RE = re.compile(r'^[\w .\-]+$', re.UNICODE)
 LONGEST_CB_PREFIX = "show_instructions_"
 
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
+# httpx на INFO печатает полный URL запроса, а токен бота — часть этого URL.
+# С уровнем WARNING в журнал попадают только сбои, без секрета в тексте лога.
+logging.getLogger("httpx").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
 # --- Вспомогательные функции ---
