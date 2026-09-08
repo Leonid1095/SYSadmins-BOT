@@ -1,4 +1,4 @@
 # Зависимости агента (agent.py), устанавливаются на КАЖДЫЙ наблюдаемый сервер
 Flask==3.0.3
 psutil==6.0.0
-gunicorn==22.0.0
+gunicorn==23.0.0   # 22.x уязвим: CVE-2024-6827 (TE.CL request smuggling)

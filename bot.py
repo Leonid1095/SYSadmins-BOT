@@ -75,6 +75,14 @@ MAX_SERVER_NAME_LEN = 24
 SERVER_NAME_RE = re.compile(r'^[\w .\-]+$', re.UNICODE)
 LONGEST_CB_PREFIX = "show_instructions_"
 
+# Публичный адрес этого сервера. Подставляется в команду установки агента, чтобы
+# порт 5000 на наблюдаемой машине сразу открывался только нам.
+#
+# Задаётся руками, а не определяется автоматически: наружу машина ходит через
+# мост, и любой сервис вида ifconfig.me вернёт адрес выходного узла, а не наш.
+# Проверено — возвращал именно чужой.
+CENTRAL_IP = os.environ.get("CENTRAL_IP", "").strip() or "<IP этого сервера>"
+
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 # httpx на INFO печатает полный URL запроса, а токен бота — часть этого URL.
 # С уровнем WARNING в журнал попадают только сбои, без секрета в тексте лога.
@@ -514,12 +522,13 @@ async def show_instructions_callback(update: Update, context: ContextTypes.DEFAU
         f"под <code>root</code>.\n"
         f"<b>2.</b> Выполните:\n\n"
         f"<pre>SECRET_KEY={esc(secret_key)} \\\n"
-        f"  bash &lt;(wget -qO- {esc(AGENT_URL)})</pre>\n"
+        f"  bash &lt;(wget -qO- {esc(AGENT_URL)}) \\\n"
+        f"  --allow-from {esc(CENTRAL_IP)}</pre>\n"
         f"<b>3.</b> Вернитесь сюда и нажмите «Показать состояние».\n\n"
-        f"⚠️ <b>Закройте порт 5000</b> для всех, кроме этого бота — метрики идут "
-        f"открытым текстом:\n"
-        f"<pre>ufw allow from &lt;IP этого сервера&gt; to any port 5000\n"
-        f"ufw deny 5000</pre>\n"
+        f"🔒 <code>--allow-from</code> сразу открывает порт 5000 только этому "
+        f"серверу и закрывает всем остальным. Раньше установщик лишь советовал "
+        f"это сделать — и совет не выполнялся: сервер оказывался за фаерволом, "
+        f"который не пускал никого, и не наблюдался месяцами.\n"
         f"🔑 Ключ выше — пароль от метрик этого сервера. Сообщение с ним остаётся "
         f"в истории чата: удалите его, когда агент заработает."
     )
