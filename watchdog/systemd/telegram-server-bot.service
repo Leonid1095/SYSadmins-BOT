@@ -1,0 +1,39 @@
+[Unit]
+Description=Telegram Server Monitoring Bot
+Documentation=file:/home/plg/telegram-server-bot/README.md
+After=network.target
+
+[Service]
+# Выделенный пользователь, а не plg. Бот читает update'ы из Telegram и потому
+# является поверхностью атаки; под plg его компрометация означала бы root,
+# потому что у plg беспарольный sudo на всё. У tgbot из sudo — только
+# исполнитель починок, который сам сверяет заявку с каталогом действий.
+User=tgbot
+Group=watchdog
+
+WorkingDirectory=/home/plg/telegram-server-bot
+EnvironmentFile=/etc/telegram-server-bot.env
+Environment="HTTPS_PROXY=http://127.0.0.1:18443"
+Environment="HTTP_PROXY=http://127.0.0.1:18443"
+Environment="WATCHDOG_STATE_DIR=/var/lib/watchdog"
+# Изменяемые данные вне репозитория: право записи в каталог с кодом позволило бы
+# скомпрометированному боту переписать самого себя.
+Environment="BOT_DATA_DIR=/var/lib/telegram-bot"
+Environment="PYTHONDONTWRITEBYTECODE=1"
+
+ExecStart=/home/plg/telegram-server-bot/venv/bin/python bot.py
+Restart=always
+RestartSec=5
+
+ProtectSystem=strict
+ReadWritePaths=/var/lib/telegram-bot /var/lib/watchdog
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+ProtectKernelModules=true
+RestrictRealtime=true
+LockPersonality=true
+# NoNewPrivileges нельзя: бот вызывает sudo для исполнителя починок.
+
+[Install]
+WantedBy=multi-user.target

@@ -118,7 +118,9 @@ def new_incident_dir():
     while os.path.exists(path):
         suffix += 1
         path = os.path.join(INCIDENTS_DIR, f"{stamp}-{suffix}")
-    os.makedirs(path, mode=0o700)
+    # 0770: каталог создаёт сторож (plg), а дописывает выбор владельца бот
+    # (tgbot) — общего им ровно столько, сколько нужно, через группу watchdog.
+    os.makedirs(path, mode=0o770)
     return path
 
 
@@ -141,7 +143,7 @@ def prune_incidents():
 def _write(path, data):
     with open(path, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
-    os.chmod(path, 0o600)
+    os.chmod(path, 0o640)   # бот читает вердикт, писать в него ему незачем
 
 
 def extract_json(text):
@@ -266,7 +268,7 @@ def main():
         sys.stdout.write("\n")
         return 0
 
-    os.makedirs(INCIDENTS_DIR, mode=0o700, exist_ok=True)
+    os.makedirs(INCIDENTS_DIR, mode=0o2770, exist_ok=True)
     prune_incidents()
 
     incident_dir = new_incident_dir()

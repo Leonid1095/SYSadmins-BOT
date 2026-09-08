@@ -23,8 +23,9 @@ except Exception:
     OWNER_ID = os.getenv("OWNER_ID", "")
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-USERS_FILE = os.path.join(BASE_DIR, "users.json")
-SUBS_FILE = os.path.join(BASE_DIR, "monitor_subscribers.json")
+DATA_DIR = os.environ.get("BOT_DATA_DIR", BASE_DIR)
+USERS_FILE = os.path.join(DATA_DIR, "users.json")
+SUBS_FILE = os.path.join(DATA_DIR, "monitor_subscribers.json")
 STATE_FILE = f"/tmp/server-monitor-remote-state-{os.getuid()}.json"
 
 

@@ -230,14 +230,14 @@ def load_state():
 
 
 def save_state(state):
-    os.makedirs(STATE_DIR, mode=0o700, exist_ok=True)
+    os.makedirs(STATE_DIR, mode=0o2750, exist_ok=True)
     tmp = STATE_FILE + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(state, f, ensure_ascii=False, indent=2, sort_keys=True)
         f.flush()
         os.fsync(f.fileno())
     os.replace(tmp, STATE_FILE)
-    os.chmod(STATE_FILE, 0o600)
+    os.chmod(STATE_FILE, 0o640)
 
 
 def compare(snapshot, state):

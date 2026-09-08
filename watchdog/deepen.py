@@ -132,7 +132,7 @@ def deepen(events, context_dir):
     Каждый сборщик вызывается не более раза на цель: три события об одном
     контейнере не должны трижды тянуть его логи.
     """
-    os.makedirs(context_dir, mode=0o700, exist_ok=True)
+    os.makedirs(context_dir, mode=0o770, exist_ok=True)
     written, seen = [], set()
 
     for event in events:
@@ -154,7 +154,7 @@ def deepen(events, context_dir):
             path = os.path.join(context_dir, safe)
             with open(path, "w", encoding="utf-8", errors="replace") as f:
                 f.write(body)
-            os.chmod(path, 0o600)
+            os.chmod(path, 0o640)
             written.append(safe)
 
     return sorted(written)

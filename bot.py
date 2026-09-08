@@ -37,8 +37,15 @@ from keyboards import (
 
 # --- Настройки ---
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-USERS_FILE = os.path.join(BASE_DIR, "users.json")
-MONITOR_FILE = os.path.join(BASE_DIR, "monitor_subscribers.json")
+
+# Изменяемые данные живут вне репозитория. Причина не в аккуратности: боту нужно
+# право записи в каталог с users.json (атомарная запись создаёт временный файл
+# рядом), а дай мы это право на каталог репозитория — скомпрометированный бот
+# смог бы переписать собственный код. По умолчанию остаётся каталог проекта,
+# чтобы запуск из исходников работал без настройки.
+DATA_DIR = os.environ.get("BOT_DATA_DIR", BASE_DIR)
+USERS_FILE = os.path.join(DATA_DIR, "users.json")
+MONITOR_FILE = os.path.join(DATA_DIR, "monitor_subscribers.json")
 ASK_SERVER_NAME, ASK_IP, CONFIRM_DELETE = range(3)
 
 # Ограничения на имя сервера. Имя попадает в callback_data (лимит Telegram 64 байта),

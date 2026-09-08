@@ -81,6 +81,6 @@ def record_choice(incident_id, entry):
     try:
         with open(path, "a", encoding="utf-8") as f:
             f.write(json.dumps(entry, ensure_ascii=False) + "\n")
-        os.chmod(path, 0o600)
+        os.chmod(path, 0o660)   # пишет бот, читает сторож — обоим по группе
     except OSError:
         pass
