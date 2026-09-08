@@ -333,13 +333,32 @@ class Collector:
                 with opener.open(req, timeout=timeout) as resp:
                     data = json.loads(resp.read().decode())
             except urllib.error.HTTPError as exc:
-                # Агент ответил, пусть и отказом: путь до него рабочий, искать
-                # другой незачем — проблема на самом сервере.
-                hint = {403: "агент не принял подпись (старая версия?)",
-                        503: "у агента не настроен ключ"}.get(exc.code, "")
+                # Ответить кодом ошибки может не только агент, но и посредник:
+                # мост отдаёт 503, когда сам не смог дотянуться до цели. Раньше
+                # это принималось за ответ агента, и владелец получал уверенное
+                # «у агента не настроен ключ» про сервер, где ключ задан. Хуже
+                # того, обход маршрутов на этом прекращался: считалось, что путь
+                # рабочий и второй пробовать незачем.
+                #
+                # Отличаем по телу: наш агент отвечает JSON с полем error, мост —
+                # чем угодно другим.
+                payload = None
+                try:
+                    payload = json.loads(exc.read(4096).decode("utf-8", "replace"))
+                except Exception:
+                    pass
+
+                if not isinstance(payload, dict) or "error" not in payload:
+                    problems.append(f"{label}: посредник ответил {exc.code}, "
+                                    "до агента запрос не дошёл")
+                    continue
+
+                hint = {403: "агент не принял подпись (старая версия агента?)",
+                        503: "агент запущен, но не видит свой ключ"}.get(exc.code, "")
                 entry.update({"reachable": False, "via": label, "http": exc.code,
                               "error": f"агент отвечает {exc.code}"
-                                       + (f" — {hint}" if hint else "")})
+                                       + (f" — {hint}" if hint else "")
+                                       + f" ({payload['error']})"})
                 return entry
             except Exception as exc:
                 reason = getattr(exc, "reason", None) or type(exc).__name__
