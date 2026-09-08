@@ -193,8 +193,15 @@ class DeltaBuilder:
             return "started"
         return None
 
-    def _emit(self, kind, key, was, now, detail):
-        """Событие рождается только при смене полосы."""
+    def _emit(self, kind, key, was, now, detail, slot=None, list_field=None):
+        """Событие рождается только при смене полосы.
+
+        `slot` и `list_field` — адрес объекта в снимке. Они не нужны ни модели,
+        ни уведомлению, а нужны дожиму (`followup.py`): чтобы через полчаса
+        сказать «диск ушёл с 94% на 96%», надо знать, где именно смотреть
+        значение, а по паре «вид + имя» это восстанавливается неоднозначно —
+        у памяти, например, два разных числа с одинаковым видом и ключом.
+        """
         if was == now:
             return
 
@@ -211,11 +218,16 @@ class DeltaBuilder:
             return
 
         severity = "resolved" if SEVERITY_ORDER[now] < SEVERITY_ORDER.get(was, 0) else now
-        self.events.append({
+        event = {
             "kind": kind, "key": key,
             "from": was, "to": now,
             "severity": severity, "detail": detail,
-        })
+        }
+        if slot:
+            event["slot"] = slot
+        if list_field:
+            event["list_field"] = list_field
+        self.events.append(event)
 
     def numeric(self, facts):
         for (section, field), (warn, crit) in RISING.items():
@@ -232,7 +244,8 @@ class DeltaBuilder:
                 was = self.previous_bands.get(slot, "ok")
                 now = rising_band(value, warn, crit, was)
                 self.bands[slot] = now
-                self._emit(section, name, was, now, describe(field, name, value))
+                self._emit(section, name, was, now, describe(field, name, value),
+                           slot=slot)
 
     def swap(self, facts):
         """Своп — только при одновременном давлении на оперативную память."""
@@ -253,7 +266,7 @@ class DeltaBuilder:
         self.bands[slot] = now
         self._emit("memory", "memory", was, now,
                    f"подкачка занята на {swap_pct}%, "
-                   f"при этом оперативной памяти занято {ram_pct}%")
+                   f"при этом оперативной памяти занято {ram_pct}%", slot=slot)
 
     def certificates(self, facts):
         for url, entry in (facts.get("endpoints") or {}).items():
@@ -264,7 +277,7 @@ class DeltaBuilder:
             was = self.previous_bands.get(slot, "ok")
             now = falling_band(days, *CERT_DAYS)
             self.bands[slot] = now
-            self._emit("cert", url, was, now, f"осталось дней: {days}")
+            self._emit("cert", url, was, now, f"осталось дней: {days}", slot=slot)
 
     def http(self, facts):
         for url, entry in (facts.get("endpoints") or {}).items():
@@ -273,7 +286,8 @@ class DeltaBuilder:
             was = self.previous_bands.get(slot, "ok")
             now = "ok" if code is not None and 200 <= code < 400 else "crit"
             self.bands[slot] = now
-            self._emit("http", url, was, now, f"HTTP {code}" if code else "нет ответа")
+            self._emit("http", url, was, now,
+                       f"HTTP {code}" if code else "нет ответа", slot=slot)
 
     def remote(self, facts):
         """Доступность удалённых серверов и их метрики.
@@ -288,7 +302,7 @@ class DeltaBuilder:
             now = "ok" if reachable else "crit"
             self.bands[slot] = now
             detail = "агент отвечает" if reachable else (entry.get("error") or "агент молчит")
-            self._emit("remote", name, was, now, detail)
+            self._emit("remote", name, was, now, detail, slot=slot)
 
             if not reachable:
                 continue
@@ -300,7 +314,8 @@ class DeltaBuilder:
                 was = self.previous_bands.get(metric_slot, "ok")
                 band = rising_band(value, warn, crit, was)
                 self.bands[metric_slot] = band
-                self._emit("remote", name, was, band, f"{field}={value}")
+                self._emit("remote", name, was, band, f"{field}={value}",
+                           slot=metric_slot)
 
     def smart(self, facts):
         for dev, verdict in (facts.get("smart") or {}).items():
@@ -308,7 +323,7 @@ class DeltaBuilder:
             was = self.previous_bands.get(slot, "ok")
             now = "ok" if verdict.upper() in ("PASSED", "OK") else "crit"
             self.bands[slot] = now
-            self._emit("smart", dev, was, now, f"SMART: {verdict}")
+            self._emit("smart", dev, was, now, f"SMART: {verdict}", slot=slot)
 
     def lists(self, previous_facts, facts, skip):
         """Списки сравниваем поимённо: замена одной поломки другой не должна
@@ -324,9 +339,10 @@ class DeltaBuilder:
             now = set((facts.get(section) or {}).get(field) or [])
             was, now = _drop_ignored(was, ignore), _drop_ignored(now, ignore)
             for item in sorted(now - was):
-                self._emit(section, item, "ok", severity, field)
+                self._emit(section, item, "ok", severity, field, list_field=field)
             for item in sorted(was - now):
-                self._emit(section, item, severity, "ok", f"больше не {field}")
+                self._emit(section, item, severity, "ok", f"больше не {field}",
+                           list_field=field)
 
 
 def load_state():

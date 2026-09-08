@@ -154,9 +154,29 @@ def main():
         # Описание ошибки от Telegram печатаем, но токен в него не попадает.
         print(f"notify: не доставлено — {response.get('description')}", file=sys.stderr)
         return 1
+
+    message_id = response["result"]["message_id"]
+    # Номер сообщения нужен дожиму: напоминание должно уходить веткой к
+    # исходному, а не отдельной строкой в ленте. Раньше он просто печатался
+    # в stdout и терялся.
+    remember(result.get("incident_dir"), message_id)
     print(json.dumps({"delivered": True, "incident": result["incident"],
-                      "message_id": response["result"]["message_id"]}, ensure_ascii=False))
+                      "message_id": message_id}, ensure_ascii=False))
     return 0
+
+
+def remember(incident_dir, message_id):
+    """Кладёт номер сообщения рядом с вердиктом. Не вышло — не беда:
+    напоминание уйдёт отдельным сообщением, а не пропадёт."""
+    if not incident_dir:
+        return
+    path = os.path.join(incident_dir, "message.json")
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump({"message_id": message_id}, f)
+        os.chmod(path, 0o640)
+    except OSError as exc:
+        print(f"notify: номер сообщения не сохранён — {exc}", file=sys.stderr)
 
 
 if __name__ == "__main__":
