@@ -16,6 +16,7 @@
 сторожа обернулась бы залпом из всего, что накопилось за годы.
 """
 
+import fnmatch
 import json
 import os
 import re
@@ -32,10 +33,23 @@ STATE_FILE = os.path.join(STATE_DIR, "state.json")
 RISING = {
     ("disk", "pct"): (80, 90),
     ("memory", "used_pct"): (90, 95),
-    ("memory", "swap_pct"): (80, 95),
     ("cpu", "load_per_core_pct"): (150, 250),
     ("temperature", "cpu_c"): (80, 90),
 }
+
+# Своп намеренно вынесен из общего списка. Сам по себе он ничего не значит:
+# ядро складывает туда страницы, которых давно не касались, и не забирает их
+# обратно, пока они не понадобятся. Своп на 80% при 25 свободных гигабайтах
+# ОЗУ — это история прошлого всплеска, а не проблема сейчас.
+#
+# Ровно на таком колебании сторож будил модель дважды за полдня (08:22 «своп
+# 80%», 12:41 «тревога снята, 65%»), и оба раза модель приходила к выводу, что
+# всё в порядке. Подавление дребезга это не ловит: оно рассчитано на четыре
+# смены за полчаса, а не на медленный дрейф через порог за сутки.
+#
+# Своп становится новостью только вместе с давлением на саму память.
+SWAP_RISING = (90, 98)
+SWAP_NEEDS_RAM_PCT = 75
 # Пороги для удалённых серверов. Отдельно от локальных: там мы видим только
 # то, что отдал агент, и лезть глубже некуда.
 REMOTE_RISING = {
@@ -56,6 +70,24 @@ FLAP_LIMIT = 4
 FLAP_MUTE = 60 * 60
 
 SEVERITY_ORDER = {"ok": 0, "resolved": 0, "info": 1, "warn": 2, "crit": 3}
+
+
+def describe(field, name, value):
+    """Подпись к числу словами.
+
+    Раньше в сообщение уходило «swap_pct=80» — имя внутреннего поля и число.
+    Владельцу это ничего не говорит, а выглядит как отладочный вывод.
+    """
+    # Какой именно диск/объект — подставляет notify.py в заголовке строки,
+    # здесь повторять незачем: получалось «Диск корневого раздела: занято 91%
+    # (корневой раздел)».
+    texts = {
+        "pct": f"занято {value}%",
+        "used_pct": f"оперативной памяти занято {value}%",
+        "load_per_core_pct": f"очередь к процессору {value}% от числа ядер",
+        "cpu_c": f"температура процессора {value}°C",
+    }
+    return texts.get(field, f"{field}={value}")
 
 
 # --- Полосы -----------------------------------------------------------------
@@ -88,26 +120,46 @@ def falling_band(days, warn, crit):
 
 # --- Конфигурация исключений ------------------------------------------------
 
-def _conf_list(name):
+# Значения по умолчанию совпадают с monitor.sh. Раньше их здесь не было, и
+# сторож брал списки только из monitor.local.conf: если владелец их там не
+# переопределил, исключений не было вовсе — и сторож будил модель на комнатах
+# civ4col, которые гасятся сами.
+DEFAULT_IGNORE = {
+    "docker": "civ4col-pitboss*",
+    "systemd": "fwupd.service fwupd-refresh.service",
+}
+
+
+def _conf_list(name, default=""):
     """Читает NAME="a b c" из monitor.local.conf, не исполняя файл."""
     try:
         with open(LOCAL_CONF, encoding="utf-8") as f:
             text = f.read()
     except OSError:
-        return set()
+        return default.split()
     match = re.search(rf'^\s*{name}="([^"]*)"', text, re.MULTILINE)
-    return set(match.group(1).split()) if match else set()
+    return match.group(1).split() if match else default.split()
 
 
 def ignored():
     """Контейнеры и юниты, чья остановка — норма, а не авария.
 
     Переиспользуем те же списки, что и monitor.sh: если комнаты civ4col гасятся
-    сами через 30 минут, сторож не должен считать это происшествием."""
+    сами через 30 минут, сторож не должен считать это происшествием.
+
+    Элементы списка — шаблоны, а не точные имена: комнат заводят новые, и
+    перечислять каждую значит однажды забыть. Ровно так и вышло — pitboss4,
+    5 и 6 появились после того, как список писали, и каждое их автогашение
+    давало тревогу."""
     return {
-        "docker": _conf_list("DOCKER_IGNORE"),
-        "systemd": _conf_list("SERVICES_IGNORE"),
+        "docker": _conf_list("DOCKER_IGNORE", DEFAULT_IGNORE["docker"]),
+        "systemd": _conf_list("SERVICES_IGNORE", DEFAULT_IGNORE["systemd"]),
     }
+
+
+def _drop_ignored(names, patterns):
+    """Отсеивает имена, подходящие под любой шаблон исключений."""
+    return {n for n in names if not any(fnmatch.fnmatch(n, p) for p in patterns)}
 
 
 # --- Сравнение --------------------------------------------------------------
@@ -180,7 +232,28 @@ class DeltaBuilder:
                 was = self.previous_bands.get(slot, "ok")
                 now = rising_band(value, warn, crit, was)
                 self.bands[slot] = now
-                self._emit(section, name, was, now, f"{field}={value}")
+                self._emit(section, name, was, now, describe(field, name, value))
+
+    def swap(self, facts):
+        """Своп — только при одновременном давлении на оперативную память."""
+        memory = facts.get("memory")
+        if not isinstance(memory, dict) or "swap_pct" not in memory:
+            return
+        slot = "memory.memory.swap_pct"
+        was = self.previous_bands.get(slot, "ok")
+        swap_pct = memory["swap_pct"]
+        ram_pct = memory.get("used_pct", 0)
+
+        if ram_pct < SWAP_NEEDS_RAM_PCT:
+            # Память свободна — что бы ни лежало в свопе, это не новость.
+            now = "ok"
+        else:
+            now = rising_band(swap_pct, *SWAP_RISING, was)
+
+        self.bands[slot] = now
+        self._emit("memory", "memory", was, now,
+                   f"подкачка занята на {swap_pct}%, "
+                   f"при этом оперативной памяти занято {ram_pct}%")
 
     def certificates(self, facts):
         for url, entry in (facts.get("endpoints") or {}).items():
@@ -249,7 +322,7 @@ class DeltaBuilder:
         for section, field, severity, ignore in sources:
             was = set((previous_facts.get(section) or {}).get(field) or [])
             now = set((facts.get(section) or {}).get(field) or [])
-            was, now = was - ignore, now - ignore
+            was, now = _drop_ignored(was, ignore), _drop_ignored(now, ignore)
             for item in sorted(now - was):
                 self._emit(section, item, "ok", severity, field)
             for item in sorted(was - now):
@@ -283,6 +356,7 @@ def compare(snapshot, state):
         # Первый запуск: запоминаем базу и молчим.
         builder = DeltaBuilder({}, None)
         builder.numeric(facts)
+        builder.swap(facts)
         builder.certificates(facts)
         builder.http(facts)
         builder.smart(facts)
@@ -291,6 +365,7 @@ def compare(snapshot, state):
 
     builder = DeltaBuilder(state.get("bands"), state.get("flap"))
     builder.numeric(facts)
+    builder.swap(facts)
     builder.certificates(facts)
     builder.http(facts)
     builder.smart(facts)

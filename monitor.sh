@@ -64,7 +64,7 @@ SERVICES_IGNORE="fwupd.service fwupd-refresh.service"
 # Комнаты Civ4Col поднимаются по заказу и гасятся сами через 30 мин без игроков —
 # остановленная комната это НОРМА, а не авария. Без исключения каждое автогашение давало
 # три алерта «Контейнер не запущен», и на их фоне терялись настоящие поломки.
-DOCKER_IGNORE="civ4col-pitboss civ4col-pitboss2 civ4col-pitboss3"
+DOCKER_IGNORE="civ4col-pitboss*"
 # HTTP-эндпоинты для проверки доступности проектов, напр. ENDPOINTS=("https://site.ru" ...)
 ENDPOINTS=()
 
@@ -154,8 +154,69 @@ clear_mark() {
     mv "$tmp" "$STATE_FILE"
 }
 
+# Две очереди. ALERTS — то, о чём сторож докладывает лучше нас (с разбором и
+# кнопками): при живом стороже молчим. OWN_ALERTS — то, чего сторож не видит
+# вовсе: видеокарта, массовые баны, служба в inactive (а не failed) и
+# сертификаты доменов вне списка эндпоинтов. Эти шлём всегда.
 ALERTS=()
-add_alert() { ALERTS+=("$1"); }
+OWN_ALERTS=()
+add_alert()     { ALERTS+=("$1"); }
+add_alert_own() { OWN_ALERTS+=("$1"); }
+
+# Совпадение имени с одним из шаблонов в списке исключений.
+# Раньше сравнение шло подстрокой по всему списку, поэтому шаблоны не работали:
+# civ4col-pitboss4/5/6 завелись позже, в списке остались только 1-3, и каждое
+# самогашение комнаты давало тревогу. Теперь список — это шаблоны через пробел,
+# и "civ4col-pitboss*" закрывает их все, включая будущие.
+matches_ignore() {
+    local name="$1" pattern
+    for pattern in $2; do
+        # shellcheck disable=SC2254 — шаблон намеренно раскрывается как glob
+        case "$name" in $pattern) return 0 ;; esac
+    done
+    return 1
+}
+
+# --- Разделение ролей со сторожем -------------------------------------------
+#
+# Сторож (watchdog/) следит за тем же самым, но умеет объяснить и дать кнопки.
+# Пока он жив, дублировать его текстовыми алертами незачем: владелец получал по
+# два сообщения о каждой поломке, в двух разных форматах, и переставал читать оба.
+#
+# Поэтому monitor.sh становится страховкой, а не вторым докладчиком. Он молчит о
+# том, что покрывает сторож, ровно пока сторож свеж. Как только снимок протух
+# (сторож не отработал, упал, машине плохо) — monitor.sh снова докладывает обо
+# всём. Это его сильная сторона: он простой, крутится в root-кроне и работает
+# тогда, когда сложный сторож уже не может.
+WATCHDOG_STATE="${WATCHDOG_STATE_FILE:-/var/lib/watchdog/state.json}"
+WATCHDOG_MAX_AGE="${WATCHDOG_MAX_AGE:-900}"   # 15 мин = три пропущенных цикла
+
+watchdog_is_alive() {
+    [ "${DEFER_TO_WATCHDOG:-auto}" != "no" ] || return 1
+    [ -r "$WATCHDOG_STATE" ] || return 1
+    local age now mtime
+    now=$(date +%s)
+    mtime=$(stat -c %Y "$WATCHDOG_STATE" 2>/dev/null) || return 1
+    age=$(( now - mtime ))
+    [ "$age" -le "$WATCHDOG_MAX_AGE" ]
+}
+
+if watchdog_is_alive; then
+    WATCHDOG_COVERS=1
+    clear_mark "watchdog_stale"
+else
+    WATCHDOG_COVERS=0
+    if [ -e "$WATCHDOG_STATE" ] && [ "${DEFER_TO_WATCHDOG:-auto}" != "no" ]; then
+        # Сторож молчит — об этом надо сказать: он и есть основной канал.
+        if ! was_sent "watchdog_stale"; then
+            add_alert "🔴 <b>Сторож не отвечает.</b> Он не обновлял состояние больше $((WATCHDOG_MAX_AGE / 60)) минут, поэтому разборы и кнопки починки сейчас не приходят. Проверьте: <code>systemctl status watchdog.timer</code>"
+            mark_sent "watchdog_stale"
+        fi
+    fi
+fi
+
+# Сторож уже докладывает об этой категории — молчим, пока он жив.
+covered_by_watchdog() { [ "$WATCHDOG_COVERS" = "1" ]; }
 
 # Удалённые серверы владельца теперь опрашивает сторож (watchdog/collect.py):
 # он делает это подписанными запросами, сравнивает с прошлым снимком и присылает
@@ -166,12 +227,12 @@ add_alert() { ALERTS+=("$1"); }
 DISK_PERCENT=$(df / | awk 'NR==2{gsub("%","",$5); print $5}')
 if [ -n "$DISK_PERCENT" ] && [ "$DISK_PERCENT" -ge "$DISK_CRIT" ]; then
     if ! was_sent "disk_critical"; then
-        add_alert "🔴 <b>ДИСК КРИТИЧНО:</b> ${DISK_PERCENT}% занято на /"
+        add_alert "🔴 <b>Диск почти полон:</b> занято ${DISK_PERCENT}% корневого раздела. Когда места не останется, начнут падать базы и логи. Смотрите, чем занято: <code>docker system df</code>, <code>journalctl --disk-usage</code>"
         mark_sent "disk_critical"
     fi
 elif [ -n "$DISK_PERCENT" ] && [ "$DISK_PERCENT" -ge "$DISK_WARN" ]; then
     if ! was_sent "disk_warning"; then
-        add_alert "🟡 <b>ДИСК:</b> ${DISK_PERCENT}% занято на /"
+        add_alert "🟡 <b>Диск заполняется:</b> занято ${DISK_PERCENT}%. Пока не срочно, но стоит посмотреть, что растёт."
         mark_sent "disk_warning"
     fi
 else
@@ -183,7 +244,7 @@ if [ -n "$HDD_MOUNT" ]; then
     HDD_PERCENT=$(df "$HDD_MOUNT" 2>/dev/null | awk 'NR==2{gsub("%","",$5); print $5}')
     if [ -n "$HDD_PERCENT" ] && [ "$HDD_PERCENT" -ge "$HDD_WARN" ]; then
         if ! was_sent "hdd_warning"; then
-            add_alert "🟡 <b>HDD бэкапов:</b> ${HDD_PERCENT}% занято"
+            add_alert "🟡 <b>Диск с бэкапами заполняется:</b> занято ${HDD_PERCENT}%. Когда он кончится, новые бэкапы перестанут сохраняться — молча."
             mark_sent "hdd_warning"
         fi
     else
@@ -197,7 +258,7 @@ if [ -n "$RAM_PERCENT" ] && [ "$RAM_PERCENT" -ge "$RAM_WARN" ]; then
     if ! was_sent "ram_critical"; then
         RAM_USED=$(free -h | awk '/Mem:/ {print $3}')
         RAM_TOTAL=$(free -h | awk '/Mem:/ {print $2}')
-        add_alert "🔴 <b>RAM:</b> ${RAM_PERCENT}% (${RAM_USED}/${RAM_TOTAL})"
+        add_alert "🔴 <b>Память на исходе:</b> занято ${RAM_PERCENT}% (${RAM_USED} из ${RAM_TOTAL}). При нехватке ядро начнёт убивать процессы — обычно самый крупный, то есть чей-то рабочий сервис."
         mark_sent "ram_critical"
     fi
 elif [ -n "$RAM_PERCENT" ] && [ "$RAM_PERCENT" -lt $((RAM_WARN - 10)) ]; then
@@ -209,7 +270,7 @@ SWAP_USED=$(free | awk '/Swap:/ {print $3}')
 if [ -n "$SWAP_USED" ] && [ "$SWAP_USED" -gt "$SWAP_WARN_KB" ]; then
     if ! was_sent "swap_warning"; then
         SWAP_H=$(free -h | awk '/Swap:/ {print $3}')
-        add_alert "🟡 <b>SWAP:</b> ${SWAP_H} используется"
+        add_alert "🟡 <b>Система ушла в подкачку:</b> занято ${SWAP_H}. Всё, что попало в подкачку, работает с диска и потому заметно медленнее."
         mark_sent "swap_warning"
     fi
 else
@@ -228,13 +289,13 @@ LOAD_PCT=$(awk -v l="$LOAD" -v c="$CORES" 'BEGIN{ if (c <= 0) c = 1; printf "%d"
 
 if { [ -n "$CPU_PCT" ] && [ "$CPU_PCT" -ge "$CPU_CRIT" ]; } || { [ -n "$LOAD_PCT" ] && [ "$LOAD_PCT" -ge "$LOAD_CRIT" ]; }; then
     if ! was_sent "cpu_critical"; then
-        add_alert "🔴 <b>CPU КРИТИЧНО:</b> утилизация ${CPU_PCT}%, load ${LOAD} на ${CORES} ядер (${LOAD_PCT}%/ядро)"
+        add_alert "🔴 <b>Процессор не справляется:</b> загружен на ${CPU_PCT}%, очередь ${LOAD} на ${CORES} ядер. Задачи стоят и ждут."
         mark_sent "cpu_critical"
     fi
     clear_mark "cpu_warning"
 elif { [ -n "$CPU_PCT" ] && [ "$CPU_PCT" -ge "$CPU_WARN" ]; } || { [ -n "$LOAD_PCT" ] && [ "$LOAD_PCT" -ge "$LOAD_WARN" ]; }; then
     if ! was_sent "cpu_warning"; then
-        add_alert "🟡 <b>CPU:</b> утилизация ${CPU_PCT}%, load ${LOAD} на ${CORES} ядер (${LOAD_PCT}%/ядро)"
+        add_alert "🟡 <b>Процессор нагружен:</b> ${CPU_PCT}%, очередь ${LOAD} на ${CORES} ядер. Если это надолго — стоит посмотреть, кто грузит."
         mark_sent "cpu_warning"
     fi
 else
@@ -249,12 +310,12 @@ if command -v nvidia-smi &> /dev/null; then
 
     if [ -n "$GPU_TEMP" ] && [ "$GPU_TEMP" -ge "$GPU_TEMP_CRIT" ]; then
         if ! was_sent "gpu_temp_critical"; then
-            add_alert "🔴 <b>GPU ПЕРЕГРЕВ:</b> ${GPU_NAME} — ${GPU_TEMP}°C (нагрузка ${GPU_LOAD}%)"
+            add_alert_own "🔴 <b>Видеокарта перегревается:</b> ${GPU_NAME} — ${GPU_TEMP}°C, нагрузка ${GPU_LOAD}%. Выше 85°C она сбрасывает частоты, чтобы не сгореть."
             mark_sent "gpu_temp_critical"
         fi
     elif [ -n "$GPU_TEMP" ] && [ "$GPU_TEMP" -ge "$GPU_TEMP_WARN" ]; then
         if ! was_sent "gpu_temp_warning"; then
-            add_alert "🟡 <b>GPU температура:</b> ${GPU_NAME} — ${GPU_TEMP}°C (нагрузка ${GPU_LOAD}%)"
+            add_alert_own "🟡 <b>Видеокарта греется:</b> ${GPU_NAME} — ${GPU_TEMP}°C, нагрузка ${GPU_LOAD}%."
             mark_sent "gpu_temp_warning"
         fi
     else
@@ -263,7 +324,7 @@ if command -v nvidia-smi &> /dev/null; then
 
     if [ -n "$GPU_LOAD" ] && [ "$GPU_LOAD" -ge "$GPU_LOAD_WARN" ]; then
         if ! was_sent "gpu_load_high"; then
-            add_alert "🟡 <b>GPU нагрузка:</b> ${GPU_NAME} — ${GPU_LOAD}% (${GPU_TEMP}°C)"
+            add_alert_own "🟡 <b>Видеокарта под полной нагрузкой:</b> ${GPU_NAME} — ${GPU_LOAD}%, ${GPU_TEMP}°C."
             mark_sent "gpu_load_high"
         fi
     elif [ -n "$GPU_LOAD" ] && [ "$GPU_LOAD" -lt 80 ]; then
@@ -276,21 +337,21 @@ if command -v smartctl &> /dev/null; then
     SMART_STATUS=$(sudo -n smartctl -n standby -H "$SMART_DISK" 2>/dev/null | grep -i "result" | awk '{print $NF}')
     if [ -n "$SMART_STATUS" ] && [ "$SMART_STATUS" != "PASSED" ]; then
         if ! was_sent "smart_fail"; then
-            add_alert "🔴🔴🔴 <b>HDD SMART FAILED!</b> Требуется замена ${SMART_DISK}!"
+            add_alert "🔴 <b>Диск ${SMART_DISK} умирает.</b> Он не прошёл собственную самопроверку — это предвестник отказа, а не сбой измерения. Планируйте замену и проверьте, что бэкапы уезжают с этого диска."
             mark_sent "smart_fail"
         fi
     fi
     REALLOC=$(sudo -n smartctl -n standby -A "$SMART_DISK" 2>/dev/null | grep "Reallocated_Sector" | awk '{print $NF}')
     if [ -n "$REALLOC" ] && [ "$REALLOC" -gt 0 ]; then
         if ! was_sent "smart_realloc"; then
-            add_alert "🟡 <b>HDD:</b> ${REALLOC} переназначенных секторов"
+            add_alert "🟡 <b>Диск начал сыпаться:</b> ${REALLOC} секторов переназначено. Пока данные целы, но число обычно только растёт — следите за ним."
             mark_sent "smart_realloc"
         fi
     fi
     PENDING=$(sudo -n smartctl -n standby -A "$SMART_DISK" 2>/dev/null | grep "Current_Pending" | awk '{print $NF}')
     if [ -n "$PENDING" ] && [ "$PENDING" -gt 0 ]; then
         if ! was_sent "smart_pending"; then
-            add_alert "🟡 <b>HDD:</b> ${PENDING} ожидающих секторов"
+            add_alert "🟡 <b>На диске подозрительные секторы:</b> ${PENDING} ждут переназначения. Часто это первый признак скорого отказа."
             mark_sent "smart_pending"
         fi
     fi
@@ -301,7 +362,7 @@ for svc in $CRITICAL_SERVICES; do
     if ! systemctl is-active --quiet "$svc" 2>/dev/null; then
         [ "$svc" = "ssh" ] && systemctl is-active --quiet sshd 2>/dev/null && { clear_mark "svc_down_ssh"; continue; }
         if ! was_sent "svc_down_${svc}"; then
-            add_alert "🔴 <b>Сервис не активен:</b> $(html_escape "$svc")"
+            add_alert_own "🔴 <b>Служба остановлена:</b> $(html_escape "$svc"). Она в списке критичных и должна работать всегда. Сторож такое не ловит: он видит только упавшие (failed), а эта остановлена штатно."
             mark_sent "svc_down_${svc}"
         fi
     else
@@ -312,9 +373,9 @@ done
 # --- 7.1 ЛЮБЫЕ упавшие systemd-юниты (авто-покрытие всех проектов) ---
 while read -r unit; do
     [ -z "$unit" ] && continue
-    case " $SERVICES_IGNORE " in *" $unit "*) continue ;; esac
+    matches_ignore "$unit" "$SERVICES_IGNORE" && continue
     if ! was_sent "failed_${unit}"; then
-        add_alert "🔴 <b>Сервис упал (failed):</b> $(html_escape "$unit")"
+        add_alert "🔴 <b>Служба упала:</b> $(html_escape "$unit"). systemd пытался поднять её и сдался. Причина в журнале: <code>journalctl -u $(html_escape "$unit") -n 50</code>"
         mark_sent "failed_${unit}"
     fi
 done < <(systemctl list-units --type=service --state=failed --no-legend --plain 2>/dev/null | awk '{print $1}')
@@ -323,17 +384,23 @@ done < <(systemctl list-units --type=service --state=failed --no-legend --plain 
 if command -v docker &> /dev/null; then
     while IFS=$'\t' read -r cname cstate cstatus; do
         [ -z "$cname" ] && continue
-        case " $DOCKER_IGNORE " in *" $cname "*) continue ;; esac
+        matches_ignore "$cname" "$DOCKER_IGNORE" && continue
+        # Exited (0) — контейнер отработал и завершился сам, успешно. Так живут
+        # разовые задачи (миграции, джобы): для них остановка — это финиш, а не
+        # авария. Раньше svod-migrate-1 попадал в тревоги каждые сутки именно так.
+        case "$cstatus" in
+            "Exited (0)"*) clear_mark "docker_down_${cname}"; continue ;;
+        esac
         if [ "$cstate" != "running" ]; then
             if ! was_sent "docker_down_${cname}"; then
-                add_alert "🔴 <b>Контейнер не запущен:</b> $(html_escape "$cname") — ${cstate}"
+                add_alert "🔴 <b>Контейнер не работает:</b> $(html_escape "$cname") — ${cstate}. Проверьте: <code>docker logs --tail 50 $(html_escape "$cname")</code>"
                 mark_sent "docker_down_${cname}"
             fi
         else
             clear_mark "docker_down_${cname}"
             if printf '%s' "$cstatus" | grep -q "(unhealthy)"; then
                 if ! was_sent "docker_unhealthy_${cname}"; then
-                    add_alert "🟡 <b>Контейнер unhealthy:</b> $(html_escape "$cname")"
+                    add_alert "🟡 <b>Контейнер нездоров:</b> $(html_escape "$cname") работает, но его проверка здоровья не проходит — снаружи сервис уже может не отвечать."
                     mark_sent "docker_unhealthy_${cname}"
                 fi
             else
@@ -348,7 +415,7 @@ if command -v fail2ban-client &> /dev/null; then
     BANNED=$(sudo -n fail2ban-client status "$F2B_JAIL" 2>/dev/null | grep "Currently banned" | awk '{print $NF}')
     if [ -n "$BANNED" ] && [ "$BANNED" -ge "$F2B_BAN_WARN" ]; then
         if ! was_sent "f2b_mass_ban"; then
-            add_alert "⚠️ <b>Массовая атака:</b> ${BANNED} IP забанено (${F2B_JAIL})"
+            add_alert_own "⚠️ <b>Сервер щупают активнее обычного:</b> fail2ban заблокировал ${BANNED} адресов в правиле ${F2B_JAIL}. Само по себе это не поломка — защита работает, — но всплеск стоит заметить."
             mark_sent "f2b_mass_ban"
         fi
     elif [ -n "$BANNED" ] && [ "$BANNED" -lt $((F2B_BAN_WARN / 2)) ]; then
@@ -363,7 +430,7 @@ for url in "${ENDPOINTS[@]}"; do
     key="http_$(printf '%s' "$url" | tr -c 'a-zA-Z0-9' '_')"
     if [ "$code" = "000" ] || [ "${code:0:1}" = "5" ]; then
         if ! was_sent "$key"; then
-            add_alert "🔴 <b>Эндпоинт недоступен:</b> $(html_escape "$url") (HTTP ${code})"
+            add_alert "🔴 <b>Сайт не отвечает:</b> $(html_escape "$url") — HTTP ${code}. Проверка идёт с самого сервера, так что посетители видят то же самое."
             mark_sent "$key"
         fi
     else
@@ -385,12 +452,12 @@ for cert in /etc/letsencrypt/live/*/fullchain.pem; do
     dkey=$(printf '%s' "$DOMAIN" | tr -c 'a-zA-Z0-9' '_')
     if [ "$DAYS_LEFT" -le 0 ]; then
         if ! was_sent "ssl_expired_${dkey}"; then
-            add_alert "🔴 <b>SSL ИСТЁК:</b> $(html_escape "$DOMAIN")!"
+            add_alert_own "🔴 <b>Сертификат истёк:</b> $(html_escape "$DOMAIN"). Сайт открывается с предупреждением о небезопасности."
             mark_sent "ssl_expired_${dkey}"
         fi
     elif [ "$DAYS_LEFT" -le 14 ]; then
         if ! was_sent "ssl_${dkey}"; then
-            add_alert "🟡 <b>SSL:</b> $(html_escape "$DOMAIN") истекает через ${DAYS_LEFT} дн."
+            add_alert_own "🟡 <b>Сертификат скоро истечёт:</b> $(html_escape "$DOMAIN"), осталось ${DAYS_LEFT} дн. Обычно Let's Encrypt продлевает сам за 30 дней — если счётчик не растёт, автопродление сломалось."
             mark_sent "ssl_${dkey}"
         fi
     else
@@ -399,14 +466,27 @@ for cert in /etc/letsencrypt/live/*/fullchain.pem; do
 done
 
 # --- ОТПРАВКА (только владельцу, реальные переносы строк) ---
-if [ ${#ALERTS[@]} -gt 0 ]; then
+SEND=("${OWN_ALERTS[@]}")
+if ! covered_by_watchdog; then
+    # Сторож молчит — докладываем обо всём сами, как раньше.
+    SEND+=("${ALERTS[@]}")
+fi
+
+if [ ${#SEND[@]} -gt 0 ]; then
     MSG="🖥 <b>Сервер $(html_escape "$HOSTNAME")</b>"$'\n\n'
-    MSG+=$(printf '%s\n' "${ALERTS[@]}")
+    MSG+=$(printf '%s\n\n' "${SEND[@]}")
+    if covered_by_watchdog; then
+        MSG+=$'\n'"<i>Это то, чего сторож не видит. Об остальном он доложит сам, с разбором и кнопками.</i>"
+    fi
     MSG+=$'\n'"⏰ $(date '+%d.%m.%Y %H:%M')"
     notify "$MSG"
 fi
 
-# --- Сброс state раз в сутки (00:00–00:06) — чистит устаревшие маркеры ---
-if [ "$(date +%H)" = "00" ] && [ "$(date +%M)" -lt 6 ]; then
-    > "$STATE_FILE"
-fi
+# Суточного обнуления состояния здесь больше нет. Оно задумывалось как уборка
+# устаревших меток, но на деле означало, что каждую ночь заново приходят ВСЕ
+# активные тревоги — те же самые, что вчера. Именно так «мониторинг» и
+# превращается в спам, который перестают читать.
+#
+# Метка снимается тогда, когда пропадает её причина: за это отвечает clear_mark
+# в каждой проверке. Осиротевшие метки (например, от удалённого контейнера)
+# безвредны: они лишь означают, что о несуществующем объекте не напомнят.

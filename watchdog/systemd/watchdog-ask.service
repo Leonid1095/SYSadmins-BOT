@@ -1,0 +1,28 @@
+[Unit]
+Description=PLGames Admin · ответ на вопрос по происшествию
+Documentation=file:/home/plg/telegram-server-bot/docs/watchdog-roadmap.md
+
+[Service]
+Type=oneshot
+# Под plg, а не под пользователем бота: здесь нужны credentials подписки Claude.
+# Ровно поэтому вопрос и передаётся файлом — боту доступ сюда не выдаётся.
+User=plg
+Group=plg
+WorkingDirectory=/home/plg/telegram-server-bot
+ExecStart=/home/plg/telegram-server-bot/venv/bin/python watchdog/ask-runner.py
+
+EnvironmentFile=/etc/telegram-server-bot.env
+Environment="HTTPS_PROXY=http://127.0.0.1:18443"
+Environment="HTTP_PROXY=http://127.0.0.1:18443"
+Environment="WATCHDOG_STATE_DIR=/var/lib/watchdog"
+
+# Модель думает десятки секунд; запас на несколько вопросов подряд.
+UMask=0002
+TimeoutStartSec=300
+
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+ProtectKernelModules=true
+RestrictRealtime=true
+LockPersonality=true

@@ -8,6 +8,7 @@
 """
 
 import json
+import logging
 import os
 import re
 import subprocess
@@ -38,6 +39,22 @@ def load(incident_id):
         raise IncidentError("Инцидент не найден — возможно, он уже устарел и удалён.")
     except (OSError, json.JSONDecodeError) as exc:
         raise IncidentError(f"Не удалось прочитать инцидент: {exc}")
+
+
+def directory(incident_id):
+    """Каталог инцидента по идентификатору, с проверкой формы и существования.
+
+    Идентификатор приходит из текста сообщения, на которое ответил владелец,
+    поэтому форма проверяется так же строго, как для нажатий: до файловой
+    системы не должно доходить ничего, кроме имени нужного вида.
+    """
+    if not INCIDENT_RE.match(incident_id or ""):
+        raise IncidentError("Не понял, о каком происшествии речь.")
+    path = os.path.join(INCIDENTS_DIR, incident_id)
+    if not os.path.isdir(path):
+        raise IncidentError(
+            "Это происшествие уже удалено — они хранятся две недели.")
+    return path
 
 
 def option(incident_id, index):
@@ -82,5 +99,9 @@ def record_choice(incident_id, entry):
         with open(path, "a", encoding="utf-8") as f:
             f.write(json.dumps(entry, ensure_ascii=False) + "\n")
         os.chmod(path, 0o660)   # пишет бот, читает сторож — обоим по группе
-    except OSError:
-        pass
+    except OSError as exc:
+        # Раньше здесь было молчаливое `pass`, и это скрывало настоящую поломку:
+        # каталоги инцидентов создавались без права записи для группы, поэтому
+        # аудит нажатий не писался НИ РАЗУ, а узнать об этом было неоткуда.
+        logging.getLogger(__name__).warning(
+            "не удалось записать выбор владельца в %s: %s", path, exc)

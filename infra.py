@@ -44,10 +44,15 @@ STATE_FILE = os.path.join(
 BANDS = {
     "disk":    (80, 90),
     "memory":  (90, 95),
-    "swap":    (80, 95),
     "cpu":     (150, 250),
     "temp":    (80, 90),
 }
+# Своп — особый случай, см. watchdog/delta.py: сам по себе он ничего не значит,
+# ядро просто не забирает обратно давно не тронутые страницы. Тревожен он только
+# вместе с нехваткой оперативной памяти.
+SWAP_RISING = (90, 98)
+SWAP_NEEDS_RAM_PCT = 75
+
 CERT_DAYS = (30, 10)   # warn / crit
 
 MARK = {"ok": "🟢", "warn": "🟡", "crit": "🔴", "unknown": "⚪️"}
@@ -155,14 +160,16 @@ def render_host(snapshot):
 
     swap = mem.get("swap_pct")
     if swap:
-        band = _band(swap, *BANDS["swap"])
-        if band != "ok":
-            lines.append(
-                f"{MARK[band]} <b>Подкачка</b> — занята на {swap}%. "
-                "Система выгружает процессы на диск: оперативной памяти не хватает, "
-                "и всё, что попало в подкачку, работает заметно медленнее.")
+        # Тот же критерий, что у сторожа: своп важен только при нехватке ОЗУ.
+        if (used or 0) < SWAP_NEEDS_RAM_PCT:
+            band = "ok"
+            tail = ("Это не проблема: память свободна, а в подкачке просто лежит "
+                    "то, к чему давно не обращались.")
         else:
-            lines.append(f"{MARK[band]} <b>Подкачка</b> — занята на {swap}%.")
+            band = _band(swap, *SWAP_RISING)
+            tail = ("Оперативной памяти не хватает, и система выгружает процессы "
+                    "на диск — всё, что туда попало, работает заметно медленнее.")
+        lines.append(f"{MARK[band]} <b>Подкачка</b> — занята на {swap}%. {tail}")
 
     cpu = facts.get("cpu") or {}
     load_pct, cores = cpu.get("load_per_core_pct"), cpu.get("cores")

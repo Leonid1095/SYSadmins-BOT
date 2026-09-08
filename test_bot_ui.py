@@ -192,7 +192,8 @@ class InfraRendersSafely(unittest.TestCase):
         import delta
         self.assertEqual(infra.BANDS["disk"], delta.RISING[("disk", "pct")])
         self.assertEqual(infra.BANDS["memory"], delta.RISING[("memory", "used_pct")])
-        self.assertEqual(infra.BANDS["swap"], delta.RISING[("memory", "swap_pct")])
+        self.assertEqual(infra.SWAP_RISING, delta.SWAP_RISING)
+        self.assertEqual(infra.SWAP_NEEDS_RAM_PCT, delta.SWAP_NEEDS_RAM_PCT)
         self.assertEqual(infra.BANDS["cpu"], delta.RISING[("cpu", "load_per_core_pct")])
         self.assertEqual(infra.BANDS["temp"], delta.RISING[("temperature", "cpu_c")])
         self.assertEqual(infra.CERT_DAYS, delta.CERT_DAYS)

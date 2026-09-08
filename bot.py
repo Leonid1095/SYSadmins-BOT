@@ -47,6 +47,7 @@ import infra  # чтение снимка сторожа: состояние м�
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "watchdog"))
 import incidents  # noqa: E402  — мост между кнопками сторожа и root-исполнителем
+import converse   # noqa: E402  — вопросы аналитику по инциденту
 from keyboards import (
     get_main_menu_keyboard, get_server_list_keyboard,
     get_server_management_keyboard, get_delete_confirm_keyboard,
@@ -908,6 +909,104 @@ async def watchdog_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode='HTML')
 
 
+# --- Разговор со сторожем ---------------------------------------------------
+#
+# Раньше на сообщение об инциденте нельзя было ответить: бот обрабатывал только
+# нажатия и текст внутри диалога добавления сервера, поэтому любой вопрос
+# проваливался в пустоту. Теперь ответ на сообщение — это вопрос аналитику.
+#
+# Новых полномочий у модели при этом ноль: тот же каталог инцидента, те же
+# Read/Grep/Glob (watchdog/sandbox.py). Разговор не пульт — изменить что-либо
+# по-прежнему можно только кнопкой, через каталог и root-хелпера.
+
+# Идентификатор инцидента бот берёт из текста сообщения, на которое ответили:
+# notify.py печатает его последней строкой, и он переживает правки сообщения
+# кнопками. Отдельного хранилища для этого не нужно.
+INCIDENT_ID_RE = re.compile(r"\b\d{8}T\d{6}Z(?:-\d{1,3})?\b")
+
+# Сколько ждём ответа службы. Модель думает 30-60 секунд; запас нужен, но и
+# бесконечно держать владельца в неизвестности нельзя — по истечении честно
+# говорим, что ответа нет, и куда смотреть.
+ASK_TIMEOUT = int(os.environ.get("BOT_ASK_TIMEOUT", "150"))
+ASK_POLL_SECONDS = 1.5
+
+
+class IncidentReplyFilter(filters.MessageFilter):
+    """Ответ именно на сообщение об инциденте.
+
+    Фильтр намеренно узкий: пока владелец добавляет сервер, он тоже отвечает на
+    сообщения бота, и перехватывать их здесь нельзя — шаги диалога сломались бы.
+    """
+
+    def filter(self, message) -> bool:
+        replied = getattr(message, "reply_to_message", None)
+        if replied is None:
+            return False
+        return bool(INCIDENT_ID_RE.search(replied.text or ""))
+
+
+async def ask_watchdog(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Владелец спросил про инцидент — отвечает аналитик."""
+    message = update.effective_message
+    incident_id = INCIDENT_ID_RE.search(message.reply_to_message.text or "").group(0)
+
+    # Ответ модели идёт десятки секунд. Индикатор «печатает» живёт пять, поэтому
+    # ставим видимую заглушку и правим её ответом: владелец сразу видит, что
+    # вопрос принят, а не гадает, дошёл ли он.
+    thinking = await message.reply_text("🤔 Смотрю материалы происшествия…")
+
+    try:
+        incident_dir = incidents.directory(incident_id)
+        # Модель зовёт служба под plg — у бота нет credentials подписки, и
+        # выдавать их ему нельзя (см. converse.py). Мы кладём вопрос и ждём.
+        token = await asyncio.to_thread(converse.submit, incident_dir, message.text)
+    except (incidents.IncidentError, converse.AskError) as exc:
+        await thinking.edit_text(f"⚠️ {esc(exc)}", parse_mode='HTML')
+        return
+
+    answer = None
+    deadline = asyncio.get_running_loop().time() + ASK_TIMEOUT
+    try:
+        while asyncio.get_running_loop().time() < deadline:
+            await asyncio.sleep(ASK_POLL_SECONDS)
+            answer = await asyncio.to_thread(converse.collect, token)
+            if answer is not None:
+                break
+    except converse.AskError as exc:
+        await thinking.edit_text(f"⚠️ {esc(exc)}", parse_mode='HTML')
+        return
+
+    if answer is None:
+        logger.warning("Ответ по инциденту %s не пришёл за %s c", incident_id, ASK_TIMEOUT)
+        await thinking.edit_text(
+            "⏳ Аналитик не ответил за отведённое время.\n\n"
+            "Обычно это значит, что служба ответов не запущена. Проверьте:\n"
+            "<code>systemctl status watchdog-ask.path</code>",
+            parse_mode='HTML')
+        return
+
+    await thinking.edit_text(
+        f"{esc(answer)}\n\n<i>Можно спросить ещё — ответьте на это сообщение.</i>",
+        parse_mode='HTML', disable_web_page_preview=True)
+
+
+async def unhandled_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Текст, который бот не ждал.
+
+    Раньше такие сообщения молча исчезали, и со стороны это выглядело как
+    «боту нельзя написать». Молчание в админском инструменте — худший ответ:
+    непонятно, дошло ли сообщение и жив ли бот вообще.
+    """
+    await update.effective_message.reply_text(
+        "Я понимаю два вида сообщений:\n\n"
+        "• <b>вопрос про происшествие</b> — ответьте на сообщение о нём, "
+        "и я разберу подробнее;\n"
+        "• <b>кнопки</b> — всё остальное делается ими.\n\n"
+        "Свободные команды я не выполняю: это админский бот, "
+        "и такой возможности в нём нет намеренно.",
+        reply_markup=get_main_menu_keyboard(), parse_mode='HTML')
+
+
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     logger.error("Ошибка при обработке update", exc_info=context.error)
 
@@ -970,7 +1069,18 @@ def main():
     application.add_handler(CallbackQueryHandler(watchdog_execute, pattern=r'^wdok:'))
     application.add_handler(CallbackQueryHandler(watchdog_cancel, pattern=r'^wdno:'))
 
+    # Вопрос по инциденту — ответом на сообщение о нём. Стоит ДО диалога
+    # добавления сервера: фильтр узкий (нужен идентификатор инцидента в тексте,
+    # на который отвечают), поэтому шаги диалога он не перехватывает.
+    application.add_handler(MessageHandler(
+        IncidentReplyFilter() & filters.TEXT & ~filters.COMMAND, ask_watchdog))
+
     application.add_handler(add_conv)
+
+    # Последним: всё, что не подошло никуда выше. Молча терять сообщения
+    # владельца админский бот не должен.
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND,
+                                           unhandled_text))
 
     logger.info("PLGames Admin: бот запущен, владелец %s", config.OWNER_ID)
     application.run_polling(drop_pending_updates=True)

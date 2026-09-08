@@ -77,14 +77,24 @@ echo "▸ Каталог состояния"
 # читать вердикты после первого же нового инцидента.
 install -d -m 2750 -o "$SERVICE_USER" -g watchdog /var/lib/watchdog
 install -d -m 2770 -o "$SERVICE_USER" -g watchdog /var/lib/watchdog/incidents
+# Обмен «вопрос-ответ» между ботом и службой. Плоский: systemd следит за
+# шаблоном только на одном уровне (см. watchdog-ask.path).
+install -d -m 2770 -o "$SERVICE_USER" -g watchdog /var/lib/watchdog/ask
 
 echo "▸ Юниты systemd"
 install -m 644 -o root -g root "$REPO/watchdog/systemd/watchdog.service" /etc/systemd/system/watchdog.service
 install -m 644 -o root -g root "$REPO/watchdog/systemd/watchdog.timer"   /etc/systemd/system/watchdog.timer
 install -m 644 -o root -g root "$REPO/watchdog/systemd/telegram-server-bot.service" \
         /etc/systemd/system/telegram-server-bot.service
+# Ответчик на вопросы владельца. Отдельная служба, потому что зовёт модель, а
+# credentials подписки принадлежат $SERVICE_USER — боту их не выдаём.
+install -m 644 -o root -g root "$REPO/watchdog/systemd/watchdog-ask.service" \
+        /etc/systemd/system/watchdog-ask.service
+install -m 644 -o root -g root "$REPO/watchdog/systemd/watchdog-ask.path" \
+        /etc/systemd/system/watchdog-ask.path
 systemctl daemon-reload
 systemctl try-restart telegram-server-bot.service || true
+systemctl enable --now watchdog-ask.path >/dev/null
 
 echo "▸ Первый проход: запоминаем базу"
 # База нужна до включения таймера: иначе первое же срабатывание доложит обо всём,

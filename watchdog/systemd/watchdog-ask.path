@@ -1,0 +1,15 @@
+[Unit]
+Description=PLGames Admin · ждёт вопрос владельца по происшествию
+Documentation=file:/home/plg/telegram-server-bot/docs/watchdog-roadmap.md
+
+[Path]
+# Реакция на появление файла, а не опрос по таймеру: ответа ждёт живой человек
+# в чате, и пять минут задержки сделали бы диалог бессмысленным.
+#
+# Каталог плоский намеренно: PathExistsGlob следит только за уровнем шаблона.
+# Проверено — заявку в incidents/<id>/ask.request systemd не замечал вовсе.
+PathExistsGlob=/var/lib/watchdog/ask/*.request
+Unit=watchdog-ask.service
+
+[Install]
+WantedBy=multi-user.target

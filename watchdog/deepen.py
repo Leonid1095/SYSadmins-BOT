@@ -151,6 +151,7 @@ def deepen(events, context_dir):
     контейнере не должны трижды тянуть его логи.
     """
     os.makedirs(context_dir, mode=0o770, exist_ok=True)
+    os.chmod(context_dir, 0o2770)   # makedirs режется umask, chmod — нет
     written, seen = [], set()
 
     for event in events:

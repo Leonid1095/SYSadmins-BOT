@@ -25,9 +25,49 @@ TIMEOUT = 20
 SEVERITY_MARK = {"crit": "🔴", "warn": "🟡", "info": "🔵", "resolved": "🟢"}
 KIND_NAME = {
     "disk": "Диск", "memory": "Память", "cpu": "Процессор",
-    "temperature": "Температура", "systemd": "Сервис", "docker": "Контейнер",
-    "http": "Эндпоинт", "cert": "Сертификат", "smart": "Диск (SMART)",
+    "temperature": "Температура", "systemd": "Служба", "docker": "Контейнер",
+    "http": "Сайт", "cert": "Сертификат", "smart": "Здоровье диска",
+    "remote": "Удалённый сервер",
 }
+
+# Для этих видов ключ совпадает с названием и повторять его незачем: строка
+# «Память: memory — ...» выглядела отладочным выводом, а не сообщением человеку.
+KIND_IS_THE_KEY = {"memory", "cpu", "temperature"}
+
+# Внутренние имена целей, у которых есть человеческое название.
+KEY_NAME = {"root": "корневого раздела", "hdd": "с бэкапами"}
+
+# Куда переехало состояние — словами. Владельцу важно не название полосы,
+# а направление: стало хуже или отпустило.
+DIRECTION = {
+    "ok": "вернулось в норму",
+    "warn": "стало хуже",
+    "crit": "стало плохо",
+    "resolved": "вернулось в норму",
+    "flapping": "скачет туда-сюда",
+}
+
+
+def describe_event(event):
+    """Одна строка «что изменилось», написанная для человека."""
+    kind = KIND_NAME.get(event.get("kind"), event.get("kind", "?"))
+    mark = SEVERITY_MARK.get(event.get("severity"), "•")
+    key = str(event.get("key") or "")
+
+    if event.get("kind") in KIND_IS_THE_KEY or key == event.get("kind"):
+        subject = f"<b>{html.escape(kind)}</b>"
+    else:
+        subject = f"<b>{html.escape(kind)}</b> {html.escape(KEY_NAME.get(key, key))}"
+
+    where = DIRECTION.get(event.get("to") or event.get("severity"), "")
+    detail = str(event.get("detail") or "")
+
+    line = f"{mark} {subject}"
+    if where:
+        line += f" — {where}"
+    if detail:
+        line += f": {html.escape(detail)}"
+    return line
 
 
 def _proxy_opener():
@@ -67,12 +107,15 @@ def render(result):
 
     lines.append("<i>Что изменилось:</i>")
     for event in result.get("events", [])[:8]:
-        kind = KIND_NAME.get(event.get("kind"), event.get("kind", "?"))
-        emark = SEVERITY_MARK.get(event.get("severity"), "•")
-        detail = f" — {esc(str(event['detail']))}" if event.get("detail") else ""
-        lines.append(f"{emark} {esc(kind)}: <code>{esc(str(event.get('key')))}</code>{detail}")
+        lines.append(describe_event(event))
 
-    lines += ["", f"<code>{esc(result['incident'])}</code>"]
+    # Подсказка про диалог. Без неё возможность не существует: владелец не
+    # догадается, что на сообщение бота вообще можно отвечать.
+    lines += ["", "<i>Ответьте на это сообщение, чтобы спросить подробнее.</i>"]
+    # Идентификатор нужен не только для порядка: по нему бот находит инцидент,
+    # когда владелец отвечает на сообщение. Отдельного хранилища для связи
+    # «сообщение → инцидент» поэтому не требуется.
+    lines += [f"<code>{esc(result['incident'])}</code>"]
     return "\n".join(lines)
 
 
