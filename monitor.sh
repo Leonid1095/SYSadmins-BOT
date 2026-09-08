@@ -22,8 +22,20 @@ if [ -z "$BOT_TOKEN" ] && [ -f "$SCRIPT_DIR/config.py" ]; then
 fi
 # Проверка «настроен хотя бы один канал» — ниже, после загрузки monitor.local.conf
 
-# Per-user, чтобы не конфликтовать по владельцу в sticky /tmp (root/plg запуски)
-STATE_FILE="/tmp/server-monitor-state-$(id -u)"
+# Состояние антиспама. Раньше лежало в /tmp по предсказуемому имени: каталог
+# общий и доступен на запись всем, а скрипт крутится в root-кроне и делает по
+# этому пути append, mv и обнуление (> "$STATE_FILE" в полночь). Ядро Ubuntu
+# такой подлог сейчас гасит (fs.protected_symlinks/protected_regular), но
+# опираться на чужой sysctl в root-скрипте незачем, и /tmp вдобавок чистится при
+# загрузке. Держим состояние в приватном каталоге; /tmp остаётся запасным путём
+# для запуска без прав на /var/lib.
+STATE_DIR="${MONITOR_STATE_DIR:-/var/lib/server-monitor}"
+if ! mkdir -p "$STATE_DIR" 2>/dev/null || [ ! -w "$STATE_DIR" ]; then
+    STATE_DIR="${TMPDIR:-/tmp}/server-monitor-$(id -u)"
+    mkdir -p "$STATE_DIR" 2>/dev/null
+fi
+chmod 700 "$STATE_DIR" 2>/dev/null
+STATE_FILE="$STATE_DIR/state-$(id -u)"
 HOSTNAME=$(hostname)
 
 # --- Пороги и цели по умолчанию (можно переопределить в monitor.local.conf) ---

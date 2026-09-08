@@ -1,65 +1,104 @@
-# keyboards.py (Финальная, синхронизированная версия)
+"""Клавиатуры бота.
+
+Правило навигации: с любого экрана видно, куда вернуться, и ни один экран не
+оканчивается тупиком. Раньше часть сообщений (удаление сервера, «сервер не
+найден», ошибка подключения) приходила вообще без кнопок — владелец оставался
+в чате с текстом и без способа продолжить, кроме /start вручную.
+
+`callback_data` ограничена Telegram 64 байтами. Имена серверов приходят от
+владельца, поэтому их длина проверяется при добавлении (см. bot.py), а не здесь.
+"""
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
+# Кнопки-возвраты собраны здесь, чтобы подпись была одинаковой на всех экранах:
+# разнобой («Назад», «В меню», «Главное меню») заставляет читать кнопку каждый раз.
+HOME = InlineKeyboardButton("🏠 Главное меню", callback_data="menu_back")
+TO_INFRA = InlineKeyboardButton("🔙 К инфраструктуре", callback_data="menu_infra")
+
+
 def get_main_menu_keyboard() -> InlineKeyboardMarkup:
-    """Возвращает главное меню для навигации."""
-    keyboard = [
-        [InlineKeyboardButton("📊 Статус активного сервера", callback_data="menu_status")],
-        [InlineKeyboardButton("🗂️ Мои серверы", callback_data="menu_myservers")],
-        [InlineKeyboardButton("🔔 Мониторинг и алерты", callback_data="menu_monitoring")],
-    ]
-    return InlineKeyboardMarkup(keyboard)
+    """Главное меню."""
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🖥 Этот сервер", callback_data="menu_host")],
+        [InlineKeyboardButton("🌐 Инфраструктура", callback_data="menu_infra")],
+        [InlineKeyboardButton("🗂 Удалённые серверы", callback_data="menu_myservers")],
+        [InlineKeyboardButton("🔔 Алерты и пороги", callback_data="menu_monitoring")],
+    ])
+
+
+def get_host_keyboard() -> InlineKeyboardMarkup:
+    """Карточка центрального сервера."""
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔄 Обновить", callback_data="menu_host")],
+        [InlineKeyboardButton("🌐 Инфраструктура", callback_data="menu_infra")],
+        [HOME],
+    ])
+
+
+def get_infra_keyboard() -> InlineKeyboardMarkup:
+    """Разделы инфраструктуры. По два в ряд — иначе список выше не помещается
+    на экране телефона вместе с кнопками."""
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("🐳 Контейнеры", callback_data="infra_containers"),
+            InlineKeyboardButton("⚙️ Службы", callback_data="infra_services"),
+        ],
+        [
+            InlineKeyboardButton("🔗 Сайты", callback_data="infra_sites"),
+            InlineKeyboardButton("🔒 Сертификаты", callback_data="infra_certs"),
+        ],
+        [InlineKeyboardButton("🛡 Безопасность", callback_data="infra_security")],
+        [InlineKeyboardButton("🔄 Обновить", callback_data="menu_infra")],
+        [HOME],
+    ])
+
+
+def get_infra_section_keyboard(section: str) -> InlineKeyboardMarkup:
+    """Экран одного раздела: обновить, назад, домой."""
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔄 Обновить", callback_data=f"infra_{section}")],
+        [TO_INFRA],
+        [HOME],
+    ])
 
 
 def get_monitoring_keyboard(is_subscribed: bool, settings: dict) -> InlineKeyboardMarkup:
-    """Клавиатура настроек мониторинга."""
-    sub_text = "🔕 Отписаться от алертов" if is_subscribed else "🔔 Подписаться на алерты"
+    """Настройки алертов."""
+    sub_text = "🔕 Отключить алерты" if is_subscribed else "🔔 Включить алерты"
     sub_data = "monitor_unsub" if is_subscribed else "monitor_sub"
 
-    keyboard = [
-        [InlineKeyboardButton(sub_text, callback_data=sub_data)],
-    ]
+    keyboard = [[InlineKeyboardButton(sub_text, callback_data=sub_data)]]
 
     if is_subscribed:
-        keyboard.append([InlineKeyboardButton(
-            f"💾 Порог диска: {settings.get('disk_warn', 80)}%",
-            callback_data="monitor_set_disk"
-        )])
-        keyboard.append([InlineKeyboardButton(
-            f"🧠 Порог RAM: {settings.get('ram_warn', 90)}%",
-            callback_data="monitor_set_ram"
-        )])
-        keyboard.append([InlineKeyboardButton(
-            f"🔥 Порог CPU: {settings.get('cpu_warn', 90)}%",
-            callback_data="monitor_set_cpu"
-        )])
-        keyboard.append([InlineKeyboardButton(
-            f"🎮 Порог GPU темп.: {settings.get('gpu_temp_warn', 80)}°C",
-            callback_data="monitor_set_gpu_temp"
-        )])
-        keyboard.append([InlineKeyboardButton(
-            "📊 Текущий статус сервера", callback_data="monitor_status_now"
-        )])
+        keyboard += [
+            [InlineKeyboardButton(
+                f"💾 Диск: предупредить на {settings.get('disk_warn', 80)}%",
+                callback_data="monitor_set_disk")],
+            [InlineKeyboardButton(
+                f"🧠 Память: предупредить на {settings.get('ram_warn', 90)}%",
+                callback_data="monitor_set_ram")],
+            [InlineKeyboardButton(
+                f"🔥 Процессор: предупредить на {settings.get('cpu_warn', 90)}%",
+                callback_data="monitor_set_cpu")],
+            [InlineKeyboardButton(
+                f"🎮 Видеокарта: предупредить на {settings.get('gpu_temp_warn', 80)}°C",
+                callback_data="monitor_set_gpu_temp")],
+        ]
 
-    keyboard.append([InlineKeyboardButton("🔙 Главное меню", callback_data="menu_back")])
+    keyboard.append([HOME])
     return InlineKeyboardMarkup(keyboard)
 
 
 def get_threshold_keyboard(param: str, current: int) -> InlineKeyboardMarkup:
-    """Клавиатура выбора порога."""
-    if param == "cpu_warn":
-        values = [70, 75, 80, 85, 90, 95]
-        fmt = "{}%"
-    elif param == "gpu_temp_warn":
-        values = [70, 75, 80, 85, 90]
-        fmt = "{}°C"
+    """Выбор порога. Текущее значение помечено галочкой, чтобы было видно,
+    что именно меняешь."""
+    if param == "gpu_temp_warn":
+        values, fmt = [70, 75, 80, 85, 90], "{}°C"
     else:
-        values = [70, 75, 80, 85, 90, 95]
-        fmt = "{}%"
+        values, fmt = [70, 75, 80, 85, 90, 95], "{}%"
 
-    keyboard = []
-    row = []
+    keyboard, row = [], []
     for v in values:
         label = f"✅ {fmt.format(v)}" if v == current else fmt.format(v)
         row.append(InlineKeyboardButton(label, callback_data=f"monitor_val_{param}_{v}"))
@@ -68,38 +107,45 @@ def get_threshold_keyboard(param: str, current: int) -> InlineKeyboardMarkup:
             row = []
     if row:
         keyboard.append(row)
-    keyboard.append([InlineKeyboardButton("🔙 Назад", callback_data="menu_monitoring")])
+    keyboard.append([InlineKeyboardButton("🔙 К алертам", callback_data="menu_monitoring")])
     return InlineKeyboardMarkup(keyboard)
+
 
 def get_server_list_keyboard(user_data: dict) -> InlineKeyboardMarkup:
-    """Динамически создает клавиатуру со списком серверов."""
+    """Список удалённых серверов. Активный помечен."""
     keyboard = []
     servers = user_data.get("servers", {})
-    active_server_name = user_data.get("active_server")
+    active = user_data.get("active_server")
 
-    for server_name in servers:
-        button_text = f"✅ {server_name}" if server_name == active_server_name else server_name
-        keyboard.append([InlineKeyboardButton(button_text, callback_data=f"select_server_{server_name}")])
-    
-    keyboard.append([InlineKeyboardButton("➕ Добавить новый сервер", callback_data="add_server_start")])
+    for name in servers:
+        text = f"✅ {name}" if name == active else name
+        keyboard.append([InlineKeyboardButton(text, callback_data=f"select_server_{name}")])
+
+    keyboard.append([InlineKeyboardButton("➕ Добавить сервер", callback_data="add_server_start")])
+    keyboard.append([HOME])
     return InlineKeyboardMarkup(keyboard)
+
 
 def get_server_management_keyboard(server_name: str) -> InlineKeyboardMarkup:
-    """Возвращает клавиатуру для управления выбранным сервером."""
-    keyboard = [
+    """Управление одним сервером."""
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📊 Показать состояние", callback_data=f"server_status_{server_name}")],
         [InlineKeyboardButton("🚀 Сделать активным", callback_data=f"set_active_{server_name}")],
-        [InlineKeyboardButton("📋 Показать инструкцию", callback_data=f"show_instructions_{server_name}")],
-        [InlineKeyboardButton("🗑️ Удалить сервер", callback_data=f"delete_server_{server_name}")],
-        [InlineKeyboardButton("🔙 К списку серверов", callback_data="menu_myservers")]
-    ]
-    return InlineKeyboardMarkup(keyboard)
+        [InlineKeyboardButton("📋 Как установить агента", callback_data=f"show_instructions_{server_name}")],
+        [InlineKeyboardButton("🗑 Удалить сервер", callback_data=f"delete_server_{server_name}")],
+        [InlineKeyboardButton("🔙 К списку серверов", callback_data="menu_myservers")],
+    ])
+
 
 def get_delete_confirm_keyboard(server_name: str) -> InlineKeyboardMarkup:
-    """Возвращает клавиатуру подтверждения удаления сервера."""
-    keyboard = [
-        [
-            InlineKeyboardButton("✅ Да, удалить", callback_data=f"confirm_delete_{server_name}"),
-            InlineKeyboardButton("❌ Отмена", callback_data=f"select_server_{server_name}"),
-        ]
-    ]
-    return InlineKeyboardMarkup(keyboard)
+    """Подтверждение удаления. Отмена — первой: её нажимают чаще."""
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("↩️ Отмена", callback_data=f"select_server_{server_name}"),
+        InlineKeyboardButton("🗑 Да, удалить", callback_data=f"confirm_delete_{server_name}"),
+    ]])
+
+
+def get_back_keyboard(target: str = "menu_back", label: str = "🏠 Главное меню") -> InlineKeyboardMarkup:
+    """Одна кнопка возврата — для экранов ошибок, которые раньше приходили
+    вообще без клавиатуры."""
+    return InlineKeyboardMarkup([[InlineKeyboardButton(label, callback_data=target)]])

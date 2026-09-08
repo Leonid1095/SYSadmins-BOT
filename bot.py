@@ -1,4 +1,19 @@
-# bot.py (Версия 8.4: Восстановлен show_instructions_callback)
+"""PLGames Admin — Telegram-бот администрирования серверов.
+
+Отвечает только владельцу (OWNER_ID); все остальные update'ы отбрасываются в
+группе -1 до всех обработчиков.
+
+Три источника данных, намеренно разные:
+  * снимок сторожа (infra.py) — состояние центрального сервера и инфраструктуры
+    на нём; собирать это самому боту нечем и не нужно;
+  * агенты на удалённых серверах — по подписанным запросам (agent_auth.py);
+  * вердикты сторожа — кнопки починки, исполняемые root-хелпером через каталог.
+
+Сообщения пишутся человеческим языком: цифра без объяснения («swap 80%») в час
+ночи не помогает решить, вставать или спать дальше. Разметка — HTML: MarkdownV2
+требует экранировать полтора десятка символов, и один пропущенный роняет всё
+сообщение целиком.
+"""
 
 import logging
 import json
@@ -13,6 +28,7 @@ import ipaddress
 import tempfile
 from functools import wraps
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.error import BadRequest
 from telegram.ext import (
     Application,
     ApplicationHandlerStop,
@@ -27,6 +43,7 @@ from telegram.ext import (
 
 import config
 import agent_auth
+import infra  # чтение снимка сторожа: состояние машины и инфраструктуры
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "watchdog"))
 import incidents  # noqa: E402  — мост между кнопками сторожа и root-исполнителем
@@ -34,6 +51,8 @@ from keyboards import (
     get_main_menu_keyboard, get_server_list_keyboard,
     get_server_management_keyboard, get_delete_confirm_keyboard,
     get_monitoring_keyboard, get_threshold_keyboard,
+    get_host_keyboard, get_infra_keyboard, get_infra_section_keyboard,
+    get_back_keyboard,
 )
 
 # --- Настройки ---
@@ -63,10 +82,39 @@ logger = logging.getLogger(__name__)
 
 # --- Вспомогательные функции ---
 
-def escape_markdown(text: str) -> str:
-    if not isinstance(text, str): text = str(text)
-    escape_chars = r'_*[]()~`>#+-=|{}.!'
-    return re.sub(f'([{re.escape(escape_chars)}])', r'\\\1', text)
+def esc(value) -> str:
+    """Экранирование для HTML-сообщений.
+
+    Бот перешёл с MarkdownV2 на HTML целиком. Причина практическая: MarkdownV2
+    требует экранировать полтора десятка символов, включая точку и дефис, и один
+    пропущенный символ роняет ВСЁ сообщение (Telegram отвечает 400, владелец не
+    видит ничего). Отсюда и брались строки вида `r"...\\."` в каждом тексте.
+    В HTML экранировать нужно три символа, и сторож (watchdog/notify.py) уже
+    пишет на нём — теперь обе половины бота говорят одинаково.
+    """
+    return html.escape(str(value))
+
+
+async def show(update: Update, text: str, reply_markup=None):
+    """Показывает экран: правит текущее сообщение или шлёт новое.
+
+    Кнопка «Обновить» часто приносит ровно тот же текст — Telegram считает это
+    ошибкой (`Message is not modified`). Для владельца это не ошибка, а «всё
+    по-прежнему», поэтому гасим её и просто подтверждаем нажатие.
+    """
+    query = update.callback_query
+    if query:
+        try:
+            await query.edit_message_text(text, reply_markup=reply_markup,
+                                          parse_mode='HTML',
+                                          disable_web_page_preview=True)
+        except BadRequest as exc:
+            if "not modified" not in str(exc).lower():
+                raise
+        return
+    await update.effective_message.reply_text(text, reply_markup=reply_markup,
+                                              parse_mode='HTML',
+                                              disable_web_page_preview=True)
 
 def _atomic_write_json(path: str, data) -> None:
     """Атомарная запись JSON: во временный файл + fsync + rename.
@@ -156,100 +204,285 @@ def server_registered(func):
         if user_id not in load_users():
             # Работает и для callback (update.message is None), и для обычных сообщений
             if update.callback_query:
-                await update.callback_query.answer("Сначала добавьте сервер через /start", show_alert=True)
+                await update.callback_query.answer(
+                    "Сначала добавьте удалённый сервер", show_alert=True)
             elif update.effective_message:
                 await update.effective_message.reply_text(
-                    r"❗️ У вас нет зарегистрированных серверов\. Используйте /start, чтобы добавить\.",
-                    parse_mode='MarkdownV2')
+                    "❗️ Удалённых серверов пока нет.\n\n"
+                    "Добавьте первый: «Удалённые серверы» → «Добавить сервер».",
+                    reply_markup=get_back_keyboard("menu_myservers", "🗂 Удалённые серверы"),
+                    parse_mode='HTML')
             return
         return await func(update, context, *args, **kwargs)
     return wrapped
 
+# Пороги для удалённых серверов — те же, по которым сторож решает, что это
+# событие (watchdog/delta.py, REMOTE_RISING). Держим согласованными, иначе бот
+# скажет «нормально» там, где сторож уже прислал алерт.
+REMOTE_BANDS = {"disk": (80, 90), "memory": (90, 95), "cpu": (85, 95)}
+
+
+def _verdict(value, warn, crit, wording):
+    """Значок и человеческая приписка к цифре."""
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return infra.MARK["unknown"], ""
+    band = "crit" if value >= crit else "warn" if value >= warn else "ok"
+    return infra.MARK[band], wording[band]
+
+
 def get_status_text(data: dict, server_name: str) -> str:
-    cpu = escape_markdown(data.get('cpu', 'N/A'))
-    cpu_temp = data.get('cpu_temp')
-    cpu_temp_text = f", {escape_markdown(str(cpu_temp))}°C" if cpu_temp is not None else ""
-    mem = data.get('memory', {})
+    """Состояние удалённого сервера словами, а не только цифрами."""
+    lines = [f"📊 <b>Сервер «{esc(server_name)}»</b>", ""]
+
     disk = data.get('disk', {})
-    mem_text = f"Использовано {escape_markdown(mem.get('used', 'N/A'))} / {escape_markdown(mem.get('total', 'N/A'))} ГБ \\({escape_markdown(mem.get('percent', 'N/A'))}%\\)"
-    disk_text = f"Использовано {escape_markdown(disk.get('used', 'N/A'))} / {escape_markdown(disk.get('total', 'N/A'))} ГБ \\({escape_markdown(disk.get('percent', 'N/A'))}%\\)"
-    text = (
-        f"*📊 Статус сервера «{escape_markdown(server_name)}»*\n\n"
-        f"🔥 *Процессор:* {cpu}%{cpu_temp_text}\n"
-        f"🧠 *Память:* {mem_text}\n"
-        f"💾 *Диск:* {disk_text}"
-    )
+    mark, note = _verdict(disk.get('percent'), *REMOTE_BANDS["disk"], {
+        "ok": "запас есть", "warn": "стоит посмотреть, чем занято",
+        "crit": "место кончается"})
+    lines.append(f"{mark} <b>Диск</b> — занято {esc(disk.get('percent', '?'))}% "
+                 f"({esc(disk.get('used', '?'))} из {esc(disk.get('total', '?'))} ГБ)"
+                 + (f". {note.capitalize()}." if note else ""))
+
+    mem = data.get('memory', {})
+    mark, note = _verdict(mem.get('percent'), *REMOTE_BANDS["memory"], {
+        "ok": "хватает", "warn": "в обрез",
+        "crit": "на исходе, процессы могут падать"})
+    lines.append(f"{mark} <b>Память</b> — занято {esc(mem.get('percent', '?'))}% "
+                 f"({esc(mem.get('used', '?'))} из {esc(mem.get('total', '?'))} ГБ)"
+                 + (f". {note.capitalize()}." if note else ""))
+
+    mark, note = _verdict(data.get('cpu'), *REMOTE_BANDS["cpu"], {
+        "ok": "не загружен", "warn": "нагрузка выше обычной",
+        "crit": "процессор не справляется"})
+    cpu_temp = data.get('cpu_temp')
+    temp_text = f", {esc(cpu_temp)}°C" if cpu_temp is not None else ""
+    lines.append(f"{mark} <b>Процессор</b> — {esc(data.get('cpu', '?'))}%{temp_text}"
+                 + (f". {note.capitalize()}." if note else ""))
+
     gpu = data.get('gpu')
     if gpu:
-        text += (
-            f"\n🎮 *GPU:* {escape_markdown(gpu.get('name', 'N/A'))} — "
-            f"нагрузка {escape_markdown(str(gpu.get('load', 'N/A')))}%, "
-            f"температура {escape_markdown(str(gpu.get('temp', 'N/A')))}°C"
-        )
-    return text
+        mark, note = _verdict(gpu.get('temp'), 80, 90, {
+            "ok": "температура в норме", "warn": "горячевато",
+            "crit": "перегрев, проверьте охлаждение"})
+        lines.append(f"{mark} <b>Видеокарта</b> — {esc(gpu.get('name', '?'))}, "
+                     f"нагрузка {esc(gpu.get('load', '?'))}%, "
+                     f"{esc(gpu.get('temp', '?'))}°C"
+                     + (f". {note.capitalize()}." if note else ""))
 
-async def send_or_edit(update: Update, text: str, reply_markup=None):
-    if update.callback_query:
-        await update.callback_query.edit_message_text(text, reply_markup=reply_markup, parse_mode='MarkdownV2')
-    else:
-        await update.message.reply_text(text, reply_markup=reply_markup, parse_mode='MarkdownV2')
+    return "\n".join(lines)
 
 # --- Обработчики ---
 
+WELCOME = (
+    "🏠 <b>PLGames Admin</b>\n\n"
+    "Пульт администратора. Отсюда видно состояние центрального сервера, "
+    "всей инфраструктуры на нём и удалённых серверов.\n\n"
+    "Выберите раздел:"
+)
+
+
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.callback_query:
+        await update.callback_query.answer()
+    await show(update, WELCOME, get_main_menu_keyboard())
+
+
+# --- Центральный сервер и инфраструктура ------------------------------------
+#
+# Данные берутся из снимка сторожа, а не собираются заново: у бота нет ни
+# доступа к docker, ни sudo, и выдавать их процессу, смотрящему в интернет,
+# ради одной кнопки не стоит. Подробности — в infra.py.
+
+async def host_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Состояние самой машины, на которой всё живёт."""
     query = update.callback_query
-    if query:
-        await query.answer()
-    
-    if update.message:
-        await update.message.reply_text(r"🏠 *Главное меню*", reply_markup=get_main_menu_keyboard(), parse_mode='MarkdownV2')
-    elif query:
-        await query.edit_message_text(r"🏠 *Главное меню*", reply_markup=get_main_menu_keyboard(), parse_mode='MarkdownV2')
+    await query.answer()
+    try:
+        snapshot = infra.load_snapshot()
+    except infra.SnapshotUnavailable as exc:
+        await show(update, f"⚠️ <b>Данных пока нет</b>\n\n{exc}", get_host_keyboard())
+        return
+
+    text = (f"🖥 <b>Центральный сервер</b>\n"
+            f"<i>данные {infra.age_text(snapshot)}</i>\n\n"
+            f"{infra.render_host(snapshot)}")
+
+    remote = infra.render_remote(snapshot)
+    if remote:
+        text += ("\n\n🗂 <b>Удалённые серверы</b>\n" + remote)
+
+    await show(update, text, get_host_keyboard())
+
+
+async def infra_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Сводка по инфраструктуре: что вообще крутится и что из этого сломано."""
+    query = update.callback_query
+    await query.answer()
+    try:
+        snapshot = infra.load_snapshot()
+    except infra.SnapshotUnavailable as exc:
+        await show(update, f"⚠️ <b>Данных пока нет</b>\n\n{exc}", get_infra_keyboard())
+        return
+
+    text = (f"🌐 <b>Инфраструктура</b>\n"
+            f"<i>данные {infra.age_text(snapshot)}</i>\n\n"
+            f"{infra.render_overview(snapshot)}\n\n"
+            f"Нажмите раздел, чтобы посмотреть подробности.")
+    await show(update, text, get_infra_keyboard())
+
+
+# Раздел → (заголовок, функция отрисовки). Список закрытый: имя раздела приходит
+# из callback_data, и подставлять по нему произвольный атрибут модуля не станем.
+INFRA_SECTIONS = {
+    "containers": ("🐳 Контейнеры", infra.render_containers),
+    "services": ("⚙️ Службы", infra.render_services),
+    "sites": ("🔗 Сайты", infra.render_sites),
+    "certs": ("🔒 Сертификаты", infra.render_certs),
+    "security": ("🛡 Безопасность", infra.render_security),
+}
+
+
+async def infra_section(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    section = query.data.removeprefix("infra_")
+    entry = INFRA_SECTIONS.get(section)
+    if entry is None:
+        await show(update, "⚠️ Неизвестный раздел.", get_infra_keyboard())
+        return
+    title, render = entry
+
+    try:
+        snapshot = infra.load_snapshot()
+    except infra.SnapshotUnavailable as exc:
+        await show(update, f"⚠️ <b>Данных пока нет</b>\n\n{exc}",
+                   get_infra_section_keyboard(section))
+        return
+
+    text = (f"<b>{title}</b>\n<i>данные {infra.age_text(snapshot)}</i>\n\n"
+            f"{render(snapshot)}")
+    await show(update, text, get_infra_section_keyboard(section))
+
+
+# --- Удалённые серверы ------------------------------------------------------
 
 async def myservers_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     user_id = str(query.from_user.id)
-    users = load_users()
-    user_data = users.get(user_id, {"servers": {}})
-    text = "🗂️ *Ваши серверы*\n\nВыберите сервер для управления или добавьте новый\\."
-    await query.edit_message_text(text, reply_markup=get_server_list_keyboard(user_data), parse_mode='MarkdownV2')
+    user_data = load_users().get(user_id, {"servers": {}})
+
+    if not user_data.get("servers"):
+        text = ("🗂 <b>Удалённые серверы</b>\n\n"
+                "Пока ни одного. Сюда добавляются <b>другие</b> машины — на них "
+                "ставится небольшой агент, и бот показывает их состояние так же, "
+                "как состояние центрального сервера.\n\n"
+                "Сам центральный сервер добавлять не нужно: он в разделе "
+                "«🖥 Этот сервер».")
+    else:
+        text = ("🗂 <b>Удалённые серверы</b>\n\n"
+                "Галочкой отмечен активный — именно его показывает кнопка "
+                "«Показать состояние» в разделе алертов.\n\n"
+                "Выберите сервер или добавьте новый:")
+    await show(update, text, get_server_list_keyboard(user_data))
+
 
 async def select_server_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     server_name = query.data.split('_', 2)[-1]
     user_id = str(query.from_user.id)
-    users = load_users()
-    server_data = users.get(user_id, {}).get("servers", {}).get(server_name)
+    server_data = load_users().get(user_id, {}).get("servers", {}).get(server_name)
 
     if not server_data:
-        await query.edit_message_text("❌ Ошибка: Сервер не найден\\.", parse_mode='MarkdownV2')
+        await show(update, "❌ Такого сервера больше нет — возможно, он удалён.",
+                   get_back_keyboard("menu_myservers", "🔙 К списку серверов"))
         return
 
     text = (
-        f"⚙️ *Управление сервером «{escape_markdown(server_name)}»*\n\n"
-        f"**IP\\-адрес:** `{escape_markdown(server_data['server_ip'])}`\n"
+        f"⚙️ <b>Сервер «{esc(server_name)}»</b>\n\n"
+        f"Адрес: <code>{esc(server_data['server_ip'])}</code>\n"
         # Ключ агента в чат не выводим: сообщение осело бы в истории Telegram
         # навсегда. Его показывает только инструкция по установке, по запросу.
-        f"**Ключ:** `{escape_markdown(server_data['secret_key'][:4])}…` \\(скрыт\\)"
+        f"Ключ агента: <code>{esc(server_data['secret_key'][:4])}…</code> "
+        f"<i>(скрыт — целиком он есть только в инструкции по установке)</i>"
     )
-    await query.edit_message_text(text, reply_markup=get_server_management_keyboard(server_name), parse_mode='MarkdownV2')
+    await show(update, text, get_server_management_keyboard(server_name))
+
 
 async def set_active_server_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
     server_name = query.data.split('_', 2)[-1]
     user_id = str(query.from_user.id)
-    
+
     users = load_users()
     if user_id in users and server_name in users[user_id].get("servers", {}):
         users[user_id]['active_server'] = server_name
         save_users(users)
-        await query.edit_message_text(f"✅ Сервер «{escape_markdown(server_name)}» назначен активным\\.", parse_mode='MarkdownV2')
-        await start_command(update, context)
+        await query.answer(f"Активный сервер: {server_name}")
+        await show(update,
+                   f"🚀 <b>«{esc(server_name)}» теперь активный</b>\n\n"
+                   "Кнопка «Показать состояние» в разделе алертов будет "
+                   "показывать именно его.",
+                   get_back_keyboard("menu_myservers", "🔙 К списку серверов"))
     else:
-        await query.edit_message_text("❌ Ошибка: Не удалось установить активный сервер\\.", parse_mode='MarkdownV2')
+        await query.answer()
+        await show(update, "❌ Не получилось: такого сервера больше нет.",
+                   get_back_keyboard("menu_myservers", "🔙 К списку серверов"))
+
+
+async def server_status_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Состояние конкретного сервера по кнопке из его карточки."""
+    query = update.callback_query
+    await query.answer("Опрашиваю сервер…")
+    server_name = query.data.removeprefix("server_status_")
+    user_id = str(query.from_user.id)
+    server = load_users().get(user_id, {}).get("servers", {}).get(server_name)
+
+    if not server:
+        await show(update, "❌ Такого сервера больше нет.",
+                   get_back_keyboard("menu_myservers", "🔙 К списку серверов"))
+        return
+
+    text = await fetch_server_status(server_name, server, user_id)
+    await show(update, text, get_server_management_keyboard(server_name))
+
+
+async def fetch_server_status(server_name: str, server: dict, user_id: str) -> str:
+    """Опрашивает агента и объясняет отказ, если он случился.
+
+    Раньше на любую сетевую ошибку приходило одно «Не удалось подключиться» —
+    по нему невозможно понять, агент не поставлен, порт закрыт или ключ разошёлся.
+    """
+    url = f"http://{server['server_ip']}:5000/status"
+    # Секрет не отправляем — только подпись этого запроса (см. agent_auth).
+    headers = agent_auth.build_headers(server['secret_key'], "GET", "/status")
+    try:
+        response = await asyncio.to_thread(requests.get, url, headers=headers, timeout=10)
+        response.raise_for_status()
+        return get_status_text(response.json(), server_name)
+    except requests.exceptions.HTTPError as exc:
+        code = exc.response.status_code if exc.response is not None else 0
+        hint = {
+            403: ("Агент не принял подпись. Обычно это старая версия агента — "
+                  "она ждёт ключ в заголовке. Переустановите агента: кнопка "
+                  "«Как установить агента»."),
+            503: ("У агента не настроен ключ: он запущен, но не видит SECRET_KEY. "
+                  "Проверьте на сервере <code>/etc/bot-agent.env</code> и "
+                  "<code>systemctl restart bot-agent</code>."),
+        }.get(code, "Агент ответил ошибкой — смотрите его журнал на сервере.")
+        logger.warning("Агент %s ответил %s", server['server_ip'], code)
+        return (f"⛔️ <b>«{esc(server_name)}» ответил ошибкой {code}</b>\n\n{hint}")
+    except requests.exceptions.RequestException as exc:
+        logger.error("Нет связи с агентом %s для %s: %s",
+                     server['server_ip'], user_id, exc)
+        return (f"⛔️ <b>«{esc(server_name)}» не отвечает</b>\n\n"
+                f"Адрес: <code>{esc(server['server_ip'])}</code>, порт 5000.\n\n"
+                "Что обычно означает:\n"
+                "• агент не установлен или не запущен;\n"
+                "• порт 5000 закрыт фаерволом для этого сервера;\n"
+                "• сервер недоступен по сети.")
 
 # --- ВОССТАНОВЛЕННАЯ ФУНКЦИЯ ---
 @server_registered
@@ -259,47 +492,46 @@ async def show_instructions_callback(update: Update, context: ContextTypes.DEFAU
     await query.answer()
     server_name = query.data.split('_', 2)[-1]
     user_id = str(query.from_user.id)
-    user_data = load_users()[user_id]
-    secret_key = user_data["servers"][server_name]['secret_key']
+    server = load_users().get(user_id, {}).get("servers", {}).get(server_name)
+    if not server:
+        await show(update, "❌ Такого сервера больше нет.",
+                   get_back_keyboard("menu_myservers", "🔙 К списку серверов"))
+        return
+    secret_key = server['secret_key']
     
     AGENT_URL = f"https://raw.githubusercontent.com/{context.bot_data.get('repo_owner', 'Leonid1095')}/{context.bot_data.get('repo_name', 'SYSadmins-BOT')}/main/install.sh"
     
+    # Ключ уходит переменной окружения, а не аргументом. Аргументы процесса
+    # лежат в /proc/<pid>/cmdline и читаются любым пользователем той машины:
+    # пока идёт установка, ключ агента видно в обычном `ps`. Окружение процесса
+    # (/proc/<pid>/environ) доступно только владельцу и root.
     text = (
-        f"📋 *Инструкция по установке агента для сервера «{escape_markdown(server_name)}»*\n\n"
-        f"1\\. Выполните на сервере \\(от `root`\\) одну команду:\n"
-        f"```bash\nwget -qO- {AGENT_URL} | bash -s -- --key {secret_key}\n```"
+        f"📋 <b>Установка агента для «{esc(server_name)}»</b>\n\n"
+        f"Агент — маленькая программа, которая отдаёт боту загрузку процессора, "
+        f"памяти и диска. Ставится одной командой.\n\n"
+        f"<b>1.</b> Зайдите на сервер <code>{esc(server['server_ip'])}</code> "
+        f"под <code>root</code>.\n"
+        f"<b>2.</b> Выполните:\n\n"
+        f"<pre>SECRET_KEY={esc(secret_key)} \\\n"
+        f"  bash &lt;(wget -qO- {esc(AGENT_URL)})</pre>\n"
+        f"<b>3.</b> Вернитесь сюда и нажмите «Показать состояние».\n\n"
+        f"⚠️ <b>Закройте порт 5000</b> для всех, кроме этого бота — метрики идут "
+        f"открытым текстом:\n"
+        f"<pre>ufw allow from &lt;IP этого сервера&gt; to any port 5000\n"
+        f"ufw deny 5000</pre>\n"
+        f"🔑 Ключ выше — пароль от метрик этого сервера. Сообщение с ним остаётся "
+        f"в истории чата: удалите его, когда агент заработает."
     )
-    # Отправляем новым сообщением, чтобы не затирать меню управления
-    await context.bot.send_message(chat_id=user_id, text=text, parse_mode='MarkdownV2')
+    # Отправляем новым сообщением, чтобы не затирать карточку сервера
+    await context.bot.send_message(chat_id=user_id, text=text, parse_mode='HTML',
+                                   disable_web_page_preview=True)
 
 
-async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer("Получаю статус...")
-    user_id = str(query.from_user.id)
-    users = load_users()
-    user_data = users.get(user_id)
-
-    if not user_data or 'active_server' not in user_data:
-        await query.edit_message_text("❗️ Активный сервер не выбран\\. Пожалуйста, выберите его в меню «Мои серверы»\\.", reply_markup=get_main_menu_keyboard(), parse_mode='MarkdownV2')
-        return
-
-    active_server_name = user_data['active_server']
-    server_info = user_data['servers'][active_server_name]
-    server_ip, secret_key = server_info['server_ip'], server_info['secret_key']
-    url = f"http://{server_ip}:5000/status"
-    # Секрет не отправляем — только подпись этого запроса (см. agent_auth).
-    headers = agent_auth.build_headers(secret_key, "GET", "/status")
-    
-    try:
-        response = await asyncio.to_thread(requests.get, url, headers=headers, timeout=10)
-        response.raise_for_status()
-        status_message = get_status_text(response.json(), active_server_name)
-        await query.edit_message_text(status_message, reply_markup=get_main_menu_keyboard(), parse_mode='MarkdownV2')
-    except requests.exceptions.RequestException as e:
-        logger.error(f"Ошибка подключения к агенту {server_ip} для {user_id}: {e}")
-        error_text = fr"⛔️ *Не удалось подключиться к активному серверу* `{escape_markdown(active_server_name)}`\."
-        await query.edit_message_text(error_text, reply_markup=get_main_menu_keyboard(), parse_mode='MarkdownV2')
+# Опрос агента жил в трёх почти одинаковых копиях: status_command,
+# monitor_status_now и карточка сервера. Именно поэтому одна из них незаметно
+# осталась на старой схеме авторизации — слала сам секрет заголовком по
+# открытому HTTP и получала в ответ 403. Теперь копия одна:
+# fetch_server_status() выше, и её зовут все кнопки.
 
 # --- Мониторинг ---
 
@@ -307,53 +539,44 @@ async def monitoring_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     user_id = str(query.from_user.id)
-    subs = load_monitor_subs()
-    user_sub = subs.get(user_id)
+    user_sub = load_monitor_subs().get(user_id)
     is_subscribed = user_sub is not None and user_sub.get("enabled", False)
     settings = user_sub if user_sub else DEFAULT_MONITOR_SETTINGS.copy()
 
     if is_subscribed:
         text = (
-            "🔔 *Мониторинг активен*\n\n"
-            "Вы получаете алерты при проблемах на сервере\\.\n"
-            "Настройте пороги срабатывания ниже\\."
+            "🔔 <b>Алерты включены</b>\n\n"
+            "Сообщение придёт, когда что-то <b>изменится</b> к худшему: кончается "
+            "место, падает служба или контейнер, сервер перестал отвечать, "
+            "истекает сертификат.\n\n"
+            "Пока всё спокойно — бот молчит. Это намеренно: уведомление про то, "
+            "что диск третьи сутки занят на 81%, быстро научило бы вас их "
+            "игнорировать.\n\n"
+            "Кнопками ниже настройте, при каких значениях предупреждать:"
         )
     else:
         text = (
-            "🔕 *Мониторинг неактивен*\n\n"
-            "Подпишитесь, чтобы получать алерты:\n"
-            "• Диск, RAM, CPU\n"
-            "• HDD здоровье \\(SMART\\)\n"
-            "• Упавшие сервисы\n"
-            "• Docker проблемы\n"
-            "• SSL сертификаты\n"
-            "• Атаки \\(fail2ban\\)"
+            "🔕 <b>Алерты выключены</b>\n\n"
+            "Сейчас бот ничего не присылает — состояние можно посмотреть только "
+            "вручную.\n\n"
+            "Если включить, будут приходить сообщения о том, что:\n"
+            "• кончается место на диске или память;\n"
+            "• упала служба или контейнер;\n"
+            "• сайт перестал отвечать;\n"
+            "• истекает сертификат;\n"
+            "• диск не проходит самопроверку;\n"
+            "• выросло число заблокированных адресов.\n\n"
+            "К серьёзным сообщениям бот приложит кнопки с вариантами починки."
         )
 
-    await query.edit_message_text(
-        text,
-        reply_markup=get_monitoring_keyboard(is_subscribed, settings),
-        parse_mode='MarkdownV2'
-    )
+    await show(update, text, get_monitoring_keyboard(is_subscribed, settings))
+
 
 async def monitor_subscribe(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     user_id = str(query.from_user.id)
 
-    # Проверить что у пользователя есть хотя бы один сервер
-    users = load_users()
-    if user_id not in users or not users[user_id].get("servers"):
-        await query.answer("Сначала добавьте сервер!")
-        await query.edit_message_text(
-            "❗️ *Сначала добавьте сервер*\n\n"
-            "Перейдите в «Мои серверы» и добавьте сервер с установленным агентом\\.\n"
-            "После этого вы сможете подписаться на мониторинг\\.",
-            reply_markup=get_monitoring_keyboard(False, DEFAULT_MONITOR_SETTINGS),
-            parse_mode='MarkdownV2'
-        )
-        return
-
-    await query.answer("Подписка оформлена!")
+    await query.answer("Алерты включены")
     subs = load_monitor_subs()
     if user_id not in subs:
         subs[user_id] = DEFAULT_MONITOR_SETTINGS.copy()
@@ -361,56 +584,97 @@ async def monitor_subscribe(update: Update, context: ContextTypes.DEFAULT_TYPE):
     subs[user_id]["username"] = query.from_user.username or query.from_user.first_name
     save_monitor_subs(subs)
 
-    await query.edit_message_text(
-        "✅ *Вы подписаны на алерты\\!*\n\n"
-        "Бот будет проверять ваш активный сервер каждые 5 минут\n"
-        "и присылать уведомления при проблемах\\.\n\n"
-        "⚠️ На сервере должен быть установлен агент\\.\n"
-        "Настройте пороги срабатывания ниже\\.",
-        reply_markup=get_monitoring_keyboard(True, subs[user_id]),
-        parse_mode='MarkdownV2'
-    )
+    # Требование «сначала добавьте сервер» убрано: центральный сервер наблюдается
+    # всегда, добавлять его никуда не нужно, и отказ подписаться на алерты о нём
+    # из-за отсутствия удалённых серверов был лишним препятствием.
+    await show(update,
+               "✅ <b>Алерты включены</b>\n\n"
+               "Проверка идёт каждые 5 минут. Придёт сообщение — значит "
+               "действительно что-то изменилось.\n\n"
+               "Ниже можно настроить, при каких значениях предупреждать. "
+               "Значения по умолчанию подобраны так, чтобы предупреждение "
+               "приходило заранее, а не когда уже поздно.",
+               get_monitoring_keyboard(True, subs[user_id]))
+
 
 async def monitor_unsubscribe(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer("Подписка отменена")
+    await query.answer("Алерты выключены")
     user_id = str(query.from_user.id)
     subs = load_monitor_subs()
     if user_id in subs:
         subs[user_id]["enabled"] = False
         save_monitor_subs(subs)
 
-    await query.edit_message_text(
-        "🔕 *Вы отписались от алертов*\n\n"
-        "Вы больше не будете получать уведомления\\.\n"
-        "Подпишитесь снова в любой момент\\.",
-        reply_markup=get_monitoring_keyboard(False, DEFAULT_MONITOR_SETTINGS),
-        parse_mode='MarkdownV2'
-    )
+    await show(update,
+               "🔕 <b>Алерты выключены</b>\n\n"
+               "Бот больше не будет присылать уведомления о поломках. "
+               "Состояние по-прежнему можно смотреть вручную в разделах "
+               "«Этот сервер» и «Инфраструктура».\n\n"
+               "Включить обратно можно в любой момент.",
+               get_monitoring_keyboard(False, DEFAULT_MONITOR_SETTINGS))
+
+
+# Что означает каждый порог — своими словами. Без этого «Порог CPU» ничего не
+# объясняет: непонятно ни что мерят, ни что будет при превышении.
+THRESHOLD_HELP = {
+    "disk_warn": ("💾 Место на диске",
+                  "Предупредить, когда диск заполнится до этого значения. "
+                  "Ниже 80% ставить не стоит — начнёте получать сообщения "
+                  "о нормальном состоянии."),
+    "ram_warn": ("🧠 Оперативная память",
+                 "Предупредить, когда занято столько памяти. При нехватке "
+                 "система начинает выгружать процессы на диск, и всё "
+                 "заметно замедляется."),
+    "cpu_warn": ("🔥 Загрузка процессора",
+                 "Предупредить, когда процессор занят настолько. Короткие "
+                 "всплески — норма; сообщение придёт, если нагрузка держится."),
+    "gpu_temp_warn": ("🎮 Температура видеокарты",
+                      "Предупредить при таком нагреве. Выше 85°C карта "
+                      "начинает сбрасывать частоты, чтобы не сгореть."),
+}
+
 
 async def monitor_set_threshold(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     param = query.data.replace("monitor_set_", "") + "_warn"
     user_id = str(query.from_user.id)
-    subs = load_monitor_subs()
-    current = subs.get(user_id, DEFAULT_MONITOR_SETTINGS).get(param, 80)
+    current = load_monitor_subs().get(user_id, DEFAULT_MONITOR_SETTINGS).get(param, 80)
 
-    labels = {"disk_warn": "💾 Порог диска", "ram_warn": "🧠 Порог RAM", "cpu_warn": "🔥 Порог CPU", "gpu_temp_warn": "🎮 Порог температуры GPU"}
-    text = f"*{escape_markdown(labels.get(param, param))}*\n\nВыберите значение:"
+    title, explain = THRESHOLD_HELP.get(param, (param, ""))
+    unit = "°C" if param == "gpu_temp_warn" else "%"
+    text = (f"<b>{title}</b>\n\n{explain}\n\n"
+            f"Сейчас: <b>{current}{unit}</b>. Выберите новое значение:")
 
-    await query.edit_message_text(
-        text,
-        reply_markup=get_threshold_keyboard(param, current),
-        parse_mode='MarkdownV2'
-    )
+    await show(update, text, get_threshold_keyboard(param, current))
+
+# Пороги, которые вообще можно менять кнопкой, и допустимый диапазон значения.
+# Раньше имя параметра и число брались из нажатия как есть: `monitor_val_x_5`
+# завёл бы в файл подписок посторонний ключ, а `monitor_val_x_abc` ронял
+# обработчик на int(). Кнопки рисуем мы, но проверять надо то, что пришло.
+ADJUSTABLE_THRESHOLDS = {
+    "disk_warn": (50, 99),
+    "ram_warn": (50, 99),
+    "cpu_warn": (50, 100),
+    "gpu_temp_warn": (50, 100),
+}
+
 
 async def monitor_set_value(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     # monitor_val_disk_warn_80 или monitor_val_gpu_temp_warn_80
     data = query.data  # "monitor_val_<param>_<value>"
-    value = int(data.rsplit("_", 1)[-1])
-    param = data.removeprefix("monitor_val_").rsplit("_", 1)[0]  # disk_warn, ram_warn, cpu_warn, gpu_temp_warn
+    param, _, raw_value = data.removeprefix("monitor_val_").rpartition("_")
+
+    bounds = ADJUSTABLE_THRESHOLDS.get(param)
+    if bounds is None or not raw_value.isdigit():
+        await query.answer("Не понял, какой порог менять.", show_alert=True)
+        return
+    value = int(raw_value)
+    if not bounds[0] <= value <= bounds[1]:
+        await query.answer(f"Допустимо {bounds[0]}–{bounds[1]}.", show_alert=True)
+        return
 
     user_id = str(query.from_user.id)
     subs = load_monitor_subs()
@@ -419,77 +683,30 @@ async def monitor_set_value(update: Update, context: ContextTypes.DEFAULT_TYPE):
     subs[user_id][param] = value
     save_monitor_subs(subs)
 
-    await query.answer(f"Установлено: {value}%")
+    unit = "°C" if param == "gpu_temp_warn" else "%"
+    await query.answer(f"Теперь предупрежу на {value}{unit}")
 
-    # Вернуться в меню мониторинга
-    await query.edit_message_text(
-        "🔔 *Мониторинг активен*\n\n"
-        f"✅ Порог обновлён: {value}%\n"
-        "Настройте другие пороги или вернитесь в меню\\.",
-        reply_markup=get_monitoring_keyboard(True, subs[user_id]),
-        parse_mode='MarkdownV2'
-    )
-
-async def monitor_status_now(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer("Собираю данные...")
-    user_id = str(query.from_user.id)
-    subs = load_monitor_subs()
-    settings = subs.get(user_id, DEFAULT_MONITOR_SETTINGS)
-
-    users = load_users()
-    user_data = users.get(user_id)
-
-    if not user_data or 'active_server' not in user_data:
-        await query.edit_message_text(
-            "❗️ *Активный сервер не выбран*\n\nВыберите сервер в «Мои серверы»\\.",
-            reply_markup=get_monitoring_keyboard(True, settings),
-            parse_mode='MarkdownV2'
-        )
-        return
-
-    active_name = user_data['active_server']
-    server_info = user_data['servers'].get(active_name, {})
-    server_ip = server_info.get('server_ip', '')
-    secret_key = server_info.get('secret_key', '')
-
-    try:
-        url = f"http://{server_ip}:5000/status"
-        headers = {"X-Secret-Key": secret_key}
-        response = await asyncio.to_thread(requests.get, url, headers=headers, timeout=10)
-        response.raise_for_status()
-        data = response.json()
-
-        # Переиспользуем единое форматирование статуса и добавляем IP + пороги
-        thresholds = (
-            "\n\n📍 IP: `" + escape_markdown(server_ip) + "`\n\n"
-            "*Ваши пороги:*\n"
-            f"  💾 Диск: {settings.get('disk_warn', 80)}%\n"
-            f"  🧠 RAM: {settings.get('ram_warn', 90)}%\n"
-            f"  🔥 CPU: {settings.get('cpu_warn', 90)}%\n"
-            f"  🎮 GPU температура: {settings.get('gpu_temp_warn', 80)}°C"
-        )
-        text = get_status_text(data, active_name) + thresholds
-    except requests.exceptions.RequestException:
-        text = (
-            f"⛔️ *Не удалось подключиться к серверу*\n"
-            f"`{escape_markdown(active_name)}` \\(`{escape_markdown(server_ip)}`\\)\n\n"
-            f"Убедитесь, что агент установлен и работает\\."
-        )
-
-    await query.edit_message_text(
-        text,
-        reply_markup=get_monitoring_keyboard(True, settings),
-        parse_mode='MarkdownV2'
-    )
+    title = THRESHOLD_HELP.get(param, (param, ""))[0]
+    await show(update,
+               f"✅ <b>Порог изменён</b>\n\n"
+               f"{title} — предупрежу при <b>{value}{unit}</b>.\n\n"
+               "Можно настроить остальные пороги или вернуться в главное меню.",
+               get_monitoring_keyboard(True, subs[user_id]))
 
 # --- Диалоги ---
 
 async def addserver_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
     await query.answer()
-    await query.edit_message_text(r"📝 Введите **имя** для вашего нового сервера \(например, `web-server-de`\)\. Имя должно быть уникальным, без пробелов\.", parse_mode='MarkdownV2')
+    await show(update,
+               "➕ <b>Новый сервер — шаг 1 из 2</b>\n\n"
+               "Придумайте название, по которому вы его узнаете. Например: "
+               "<code>DE сервер</code> или <code>прокси-NL</code>.\n\n"
+               "Можно буквы, цифры, пробел, точку, дефис и подчёркивание, "
+               "до 24 символов.\n\n"
+               "Отменить — команда /cancel")
     return ASK_SERVER_NAME
+
 
 async def ask_server_name_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     name = update.message.text.strip()
@@ -498,19 +715,34 @@ async def ask_server_name_handler(update: Update, context: ContextTypes.DEFAULT_
     error = validate_server_name(name, existing)
     if error:
         await update.message.reply_text(
-            fr"❌ {escape_markdown(error)} Попробуйте снова или /cancel\.",
-            parse_mode='MarkdownV2')
+            f"❌ {esc(error)}\n\nВведите другое название или /cancel",
+            parse_mode='HTML')
         return ASK_SERVER_NAME
     context.user_data['server_name'] = name
-    await update.message.reply_text(r"Теперь введите **IP\-адрес** этого сервера\.", parse_mode='MarkdownV2')
+    await update.message.reply_text(
+        f"➕ <b>Новый сервер «{esc(name)}» — шаг 2 из 2</b>\n\n"
+        "Теперь пришлите его IP-адрес — тот, по которому сервер доступен "
+        "из интернета. Например: <code>203.0.113.10</code>\n\n"
+        "Отменить — /cancel",
+        parse_mode='HTML')
     return ASK_IP
+
 
 async def ask_ip_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     server_ip = update.message.text.strip()
     server_name = context.user_data.get('server_name')
 
     if not is_valid_ip(server_ip):
-        await update.message.reply_text(r"❌ Некорректный IP\-адрес\. Попробуйте снова\.", parse_mode='MarkdownV2')
+        # Причину называем: «некорректный адрес» не отличает опечатку от
+        # намеренно запрещённого диапазона, и владелец сидит гадает.
+        await update.message.reply_text(
+            "❌ Это не подходит как адрес удалённого сервера.\n\n"
+            "Нужен публичный IPv4 — вида <code>203.0.113.10</code>.\n"
+            "Внутренние адреса (127.0.0.1, 192.168.*, 10.*) сюда не годятся: "
+            "этот раздел про <b>другие</b> машины, а сам центральный сервер "
+            "уже наблюдается и живёт в разделе «🖥 Этот сервер».\n\n"
+            "Попробуйте снова или /cancel",
+            parse_mode='HTML')
         return ASK_IP
 
     user_id = str(update.effective_user.id)
@@ -521,19 +753,28 @@ async def ask_ip_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     users[user_id]['active_server'] = server_name
     save_users(users)
     
-    await update.message.reply_text(fr"✅ Сервер `{escape_markdown(server_name)}` успешно добавлен и назначен активным\!", parse_mode='MarkdownV2')
-    await start_command(update, context)
+    await update.message.reply_text(
+        f"✅ <b>Сервер «{esc(server_name)}» добавлен</b>\n\n"
+        f"Адрес: <code>{esc(server_ip)}</code>. Он назначен активным.\n\n"
+        "<b>Осталось поставить на него агента</b> — без этого бот не увидит "
+        "его состояние. Откройте «Удалённые серверы» → выберите этот сервер → "
+        "«Как установить агента»: там готовая команда.",
+        reply_markup=get_back_keyboard("menu_myservers", "🗂 К списку серверов"),
+        parse_mode='HTML')
     return ConversationHandler.END
 
 async def deleteserver_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     server_name = query.data.split('_', 2)[-1]
-    await query.edit_message_text(
-        fr"⚠️ Вы уверены, что хотите удалить сервер `{escape_markdown(server_name)}`\?",
-        reply_markup=get_delete_confirm_keyboard(server_name),
-        parse_mode='MarkdownV2'
-    )
+    await show(update,
+               f"🗑 <b>Удалить «{esc(server_name)}»?</b>\n\n"
+               "Из бота пропадёт запись о сервере и его ключ. Сам сервер и "
+               "установленный на нём агент останутся работать — если соберётесь "
+               "добавить его обратно, агента придётся переустановить с новым "
+               "ключом.",
+               get_delete_confirm_keyboard(server_name))
+
 
 async def confirm_delete_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -550,23 +791,20 @@ async def confirm_delete_callback(update: Update, context: ContextTypes.DEFAULT_
         if not users[user_id]["servers"]:
             del users[user_id]
         save_users(users)
-        await query.edit_message_text(
-            fr"✅ Сервер `{escape_markdown(server_name)}` удалён\.",
-            parse_mode='MarkdownV2'
-        )
-        # Show main menu after deletion
-        await context.bot.send_message(
-            chat_id=user_id,
-            text=r"🏠 *Главное меню*",
-            reply_markup=get_main_menu_keyboard(),
-            parse_mode='MarkdownV2'
-        )
+        # Одним сообщением вместо двух: раньше следом прилетало отдельное
+        # «Главное меню», и подтверждение уезжало вверх.
+        await show(update,
+                   f"✅ <b>«{esc(server_name)}» удалён</b>\n\n"
+                   "Запись и ключ убраны из бота.",
+                   get_back_keyboard("menu_myservers", "🗂 К списку серверов"))
     else:
-        await query.edit_message_text("❌ Сервер не найден\\.", parse_mode='MarkdownV2')
+        await show(update, "❌ Такого сервера уже нет — возможно, он удалён раньше.",
+                   get_back_keyboard("menu_myservers", "🗂 К списку серверов"))
 
 async def cancel_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    await send_or_edit(update, r"❌ Действие отменено\.")
-    await start_command(update, context)
+    context.user_data.pop('server_name', None)
+    await show(update, "↩️ Добавление отменено — ничего не сохранено.",
+               get_main_menu_keyboard())
     return ConversationHandler.END
 
 # --- Сторож: доступ и кнопки ------------------------------------------------
@@ -610,8 +848,7 @@ async def watchdog_option(update: Update, context: ContextTypes.DEFAULT_TYPE):
         incident_id, index = _parse_callback(query.data)
         result, chosen = incidents.option(incident_id, index)
     except incidents.IncidentError as exc:
-        await query.edit_message_text(f"⚠️ {escape_markdown(str(exc))}",
-                                      parse_mode='MarkdownV2')
+        await query.edit_message_text(f"⚠️ {esc(exc)}", parse_mode='HTML')
         return
 
     if chosen["action"] == "nothing":
@@ -621,10 +858,15 @@ async def watchdog_option(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode='HTML')
         return
 
-    target = f" → <code>{chosen['target']}</code>" if chosen.get("target") else ""
+    # Экранируем всё, что пришло из вердикта: его писала модель, а она читала
+    # логи, в которые пишет посторонний. Неэкранированный текст здесь либо ломал
+    # разметку (Telegram отвечает 400, кнопка «молчит»), либо позволял вложить
+    # в админский алерт чужую ссылку. В watchdog_execute это уже делалось.
+    target = (f" → <code>{html.escape(str(chosen['target']))}</code>"
+              if chosen.get("target") else "")
     await query.edit_message_text(
-        f"{query.message.text_html}\n\n❓ <b>{chosen['label']}</b>{target}\n"
-        f"<i>{chosen['why']}</i>\n\nВыполнить?",
+        f"{query.message.text_html}\n\n❓ <b>{html.escape(str(chosen['label']))}</b>{target}\n"
+        f"<i>{html.escape(str(chosen['why']))}</i>\n\nВыполнить?",
         parse_mode='HTML', reply_markup=_remedy_keyboard(incident_id, index))
 
 
@@ -667,7 +909,7 @@ async def watchdog_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
-    logger.error(f"Exception while handling an update:", exc_info=context.error)
+    logger.error("Ошибка при обработке update", exc_info=context.error)
 
 async def post_init(application: Application):
     application.bot_data['repo_owner'] = 'Leonid1095'
@@ -700,19 +942,25 @@ def main():
     
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CallbackQueryHandler(start_command, pattern='^menu_back$'))
-    application.add_handler(CallbackQueryHandler(status_command, pattern='^menu_status$'))
-    application.add_handler(CallbackQueryHandler(myservers_menu, pattern='^menu_myservers$'))
-    # Мониторинг
+
+    # Центральный сервер и его инфраструктура — из снимка сторожа.
+    application.add_handler(CallbackQueryHandler(host_menu, pattern='^menu_host$'))
+    application.add_handler(CallbackQueryHandler(infra_menu, pattern='^menu_infra$'))
+    application.add_handler(CallbackQueryHandler(
+        infra_section, pattern=r'^infra_(containers|services|sites|certs|security)$'))
+
+    # Алерты и пороги.
     application.add_handler(CallbackQueryHandler(monitoring_menu, pattern='^menu_monitoring$'))
     application.add_handler(CallbackQueryHandler(monitor_subscribe, pattern='^monitor_sub$'))
     application.add_handler(CallbackQueryHandler(monitor_unsubscribe, pattern='^monitor_unsub$'))
     application.add_handler(CallbackQueryHandler(monitor_set_threshold, pattern=r'^monitor_set_(disk|ram|cpu|gpu_temp)$'))
     application.add_handler(CallbackQueryHandler(monitor_set_value, pattern=r'^monitor_val_'))
-    application.add_handler(CallbackQueryHandler(monitor_status_now, pattern='^monitor_status_now$'))
 
+    # Удалённые серверы.
+    application.add_handler(CallbackQueryHandler(myservers_menu, pattern='^menu_myservers$'))
     application.add_handler(CallbackQueryHandler(select_server_callback, pattern=r'^select_server_'))
+    application.add_handler(CallbackQueryHandler(server_status_callback, pattern=r'^server_status_'))
     application.add_handler(CallbackQueryHandler(set_active_server_callback, pattern=r'^set_active_'))
-    # ИСПРАВЛЕНИЕ: Добавляем обработчик для новой кнопки
     application.add_handler(CallbackQueryHandler(show_instructions_callback, pattern=r'^show_instructions_'))
     application.add_handler(CallbackQueryHandler(deleteserver_start, pattern=r'^delete_server_'))
     application.add_handler(CallbackQueryHandler(confirm_delete_callback, pattern=r'^confirm_delete_'))
@@ -724,7 +972,7 @@ def main():
 
     application.add_handler(add_conv)
 
-    logger.info("Центральный бот (v8.4, Финальная версия) запущен...")
+    logger.info("PLGames Admin: бот запущен, владелец %s", config.OWNER_ID)
     application.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":

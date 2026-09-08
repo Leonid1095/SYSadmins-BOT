@@ -167,10 +167,12 @@ class Collector:
         if out is None:
             return None
         stopped, unhealthy, restarting = [], [], []
+        total = 0
         for line in out.splitlines():
             parts = line.split("\t")
             if len(parts) != 3:
                 continue
+            total += 1
             name, state, status = parts
             if "unhealthy" in status.lower():
                 unhealthy.append(name)
@@ -179,6 +181,11 @@ class Collector:
             elif state != "running":
                 stopped.append(name)
         return {
+            # Общее число нужно, чтобы бот мог сказать «работают 47 из 54».
+            # Само по себе оно события не рождает: delta.py сравнивает только
+            # списки имён, а не счётчик, иначе один поднятый контейнер выглядел
+            # бы изменением инфраструктуры.
+            "total": total,
             "stopped": sorted(stopped),
             "unhealthy": sorted(unhealthy),
             "restarting": sorted(restarting),
