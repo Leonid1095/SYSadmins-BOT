@@ -268,26 +268,53 @@ def _resolved_verdict(events):
     }
 
 
-def _crit_model(events):
-    """Сильная модель — только на настоящем крите и только пока есть суточный запас."""
+BUDGET_FILE = ".crit-upgrades.json"
+
+
+def choose_model(events, now=None):
+    """Какой моделью разбирать этот инцидент.
+
+    Обычная работа идёт на Sonnet: подписка общая с повседневными задачами
+    владельца, и «контейнер моргнул» не стоит сильной модели. Но падение
+    флагмана разбирать той же моделью — экономия не там, поэтому на настоящем
+    крите берётся модель сильнее.
+
+    Ограничитель обязателен. Подавление дребезга в delta.py ловит объект,
+    скачущий туда-сюда, но не череду разных критов подряд: ночь, когда
+    посыпалось всё сразу, без потолка выела бы подписку целиком.
+
+    Исчерпанный потолок не отменяет разбор — он снижает его до обычной модели
+    и ставит пометку. Молчание вместо разбора было бы худшим из исходов:
+    именно в такую ночь уведомление и нужно.
+    """
     if not any(e.get("severity") == "crit" for e in events):
-        return None
-    path = os.path.join(STATE_DIR, ".crit-upgrades.json")
-    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        return {"model": sandbox.MODEL, "upgraded": False, "exhausted": False}
+
+    path = os.path.join(STATE_DIR, BUDGET_FILE)
+    today = (now or datetime.now(timezone.utc)).strftime("%Y-%m-%d")
     try:
         with open(path, encoding="utf-8") as f:
             data = json.load(f)
     except (OSError, json.JSONDecodeError):
         data = {}
     used = data.get("count", 0) if data.get("day") == today else 0
+
     if used >= MAX_CRIT_UPGRADES_PER_DAY:
-        return None
+        return {"model": sandbox.MODEL, "upgraded": False, "exhausted": True,
+                "used": used, "limit": MAX_CRIT_UPGRADES_PER_DAY}
+
+    # Счётчик увеличиваем до разбора, а не после. Разбор может не дойти до
+    # конца, и тогда попытка окажется неучтённой — но потратит те же ресурсы.
     try:
-        with open(path, "w", encoding="utf-8") as f:
+        tmp = f"{path}.tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
             json.dump({"day": today, "count": used + 1}, f)
+        os.replace(tmp, path)
+        os.chmod(path, 0o640)
     except OSError:
         pass
-    return sandbox.MODEL_CRIT
+    return {"model": sandbox.MODEL_CRIT, "upgraded": True, "exhausted": False,
+            "used": used + 1, "limit": MAX_CRIT_UPGRADES_PER_DAY}
 
 
 def main():
@@ -328,8 +355,9 @@ def main():
         sys.stdout.write("\n")
         return 0
 
+    choice = choose_model(events)
     try:
-        text, meta = asyncio.run(analyse(incident_dir, events, _crit_model(events)))
+        text, meta = asyncio.run(analyse(incident_dir, events, choice["model"]))
     except Exception as exc:
         # Модель недоступна — это не повод молчать о поломке. Отдаём сырые
         # события, чтобы уведомление всё равно ушло владельцу.
@@ -354,6 +382,12 @@ def main():
         else:
             verdict = parsed
         verdict = sanitize(verdict, events)
+
+    # Каким разбором это оказалось — видно и в вердикте, и в уведомлении.
+    # Без этого «разобрано обычной моделью, потому что потолок исчерпан»
+    # выглядело бы как «разобрано сильной», и доверять пометке было бы нельзя.
+    meta.update({"model": choice["model"], "crit_upgrade": choice["upgraded"],
+                 "crit_budget_exhausted": choice["exhausted"]})
 
     result = {
         "analysed": True,

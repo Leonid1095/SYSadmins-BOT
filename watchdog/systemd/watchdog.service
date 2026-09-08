@@ -22,6 +22,14 @@ Environment="WATCHDOG_STATE_DIR=/var/lib/watchdog"
 # по группе watchdog, чтобы опрашивать удалённых агентов.
 Environment="BOT_DATA_DIR=/var/lib/telegram-bot"
 
+# Обычный разбор — на Sonnet: подписка общая с повседневной работой владельца.
+# Настоящий крит берёт модель сильнее, но не чаще WATCHDOG_CRIT_PER_DAY раз в
+# сутки — иначе ночь, когда посыпалось всё сразу, выела бы подписку целиком.
+# Уточняющие вопросы по инциденту всегда идут на обычной модели.
+Environment="WATCHDOG_MODEL=claude-sonnet-5"
+Environment="WATCHDOG_MODEL_CRIT=claude-opus-5"
+Environment="WATCHDOG_CRIT_PER_DAY=8"
+
 # StateDirectory намеренно НЕ используется: он выставлял бы владельца по User и
 # Group юнита на каждом старте и стирал бы группу watchdog, через которую бот
 # читает вердикты. Каталог создаёт install.sh, а общий доступ держится на setgid.
