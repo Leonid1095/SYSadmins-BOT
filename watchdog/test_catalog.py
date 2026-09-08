@@ -66,6 +66,124 @@ class CatalogTest(unittest.TestCase):
             with self.assertRaises(catalog.RemedyError):
                 catalog.resolve("restart_container", "svod-bot-1")
 
+    # --- Отказы: новые действия (фаза 11) -----------------------------------
+
+    def test_поднимать_можно_только_остановленный_контейнер(self):
+        """Работающий контейнер трогать незачем, а restarting уже пытается сам."""
+        rows = {"svod-bot-1": ("running", "Up 2 hours")}
+        with mock.patch.object(catalog, "_container_rows", return_value=rows):
+            with self.assertRaises(catalog.RemedyError) as ctx:
+                catalog.resolve("start_container", "svod-bot-1")
+            self.assertIn("работает", str(ctx.exception))
+
+    def test_отказ_называет_настоящую_причину(self):
+        """Неверный диагноз владелец принимает за факт — сегодня это уже
+        стоило ложного «у агента не настроен ключ». Отказ про завершившуюся
+        разовую задачу не должен выглядеть как отказ про работающий контейнер."""
+        rows = {"svod-migrate-1": ("exited", "Exited (0) 6 days ago")}
+        with mock.patch.object(catalog, "_container_rows", return_value=rows), \
+             mock.patch.object(catalog, "ignored_containers", return_value=[]):
+            with self.assertRaises(catalog.RemedyError) as ctx:
+                catalog.resolve("start_container", "svod-migrate-1")
+        self.assertIn("кодом 0", str(ctx.exception))
+        self.assertNotIn("работает", str(ctx.exception))
+
+    def test_несуществующий_контейнер_так_и_называется(self):
+        with mock.patch.object(catalog, "_container_rows", return_value={}), \
+             mock.patch.object(catalog, "ignored_containers", return_value=[]):
+            with self.assertRaises(catalog.RemedyError) as ctx:
+                catalog.resolve("start_container", "no-such-container")
+        self.assertIn("нет", str(ctx.exception))
+
+    def test_контейнер_из_исключений_не_поднимаем(self):
+        """Комнаты civ4col гасятся сами; поднять такую — спорить с её
+        собственным устройством."""
+        with mock.patch.object(catalog, "stopped_containers",
+                               return_value={"civ4col-pitboss5"}), \
+             mock.patch.object(catalog, "ignored_containers",
+                               return_value=["civ4col-pitboss*"]):
+            with self.assertRaises(catalog.RemedyError) as ctx:
+                catalog.resolve("start_container", "civ4col-pitboss5")
+            self.assertIn("штатно", str(ctx.exception))
+
+    def test_разовая_задача_не_поднимается_повторно(self):
+        """Вышел с кодом 0 — не сломался, а закончил. На этой машине под
+        описание попадает svod-migrate-1: «поднять» её значит прогнать
+        миграцию базы второй раз."""
+        rows = {"svod-migrate-1": ("exited", "Exited (0) 6 days ago"),
+                "svod-bot-1": ("exited", "Exited (137) 2 hours ago")}
+        with mock.patch.object(catalog, "_container_rows", return_value=rows):
+            self.assertEqual(catalog.stopped_containers(), {"svod-bot-1"})
+
+    def test_перезапускающийся_контейнер_не_трогаем(self):
+        """Он уже пытается подняться сам."""
+        rows = {"c": ("restarting", "Restarting (1) 5 seconds ago")}
+        with mock.patch.object(catalog, "_container_rows", return_value=rows):
+            self.assertEqual(catalog.stopped_containers(), set())
+            # Но как «сломанный» он виден: рестарт — другое действие.
+            self.assertEqual(catalog.broken_containers(), {"c"})
+
+    def test_инъекция_в_имя_поднимаемого_контейнера_отвергнута(self):
+        for target in ("; docker run -v /:/host alpine", "../../etc", "-v/:/host"):
+            with self.subTest(target=target):
+                with self.assertRaises(catalog.RemedyError):
+                    catalog.resolve("start_container", target)
+
+    def test_отметку_снимаем_только_с_упавшего_юнита(self):
+        with mock.patch.object(catalog, "failed_units", return_value=set()):
+            with self.assertRaises(catalog.RemedyError) as ctx:
+                catalog.resolve("reset_failed", "nginx.service")
+            self.assertIn("снимать нечего", str(ctx.exception))
+
+    def test_запретные_юниты_защищены_и_от_снятия_отметки(self):
+        """Запрет должен держать все действия над юнитом, а не только рестарт:
+        иначе новое действие тихо обходит старую защиту."""
+        with mock.patch.object(catalog, "failed_units",
+                               return_value={"ssh.service", "xray-bridge.service"}):
+            for target in ("ssh.service", "xray-bridge.service"):
+                with self.subTest(target=target):
+                    with self.assertRaises(catalog.RemedyError) as ctx:
+                        catalog.resolve("reset_failed", target)
+                    self.assertIn("запрет", str(ctx.exception))
+
+    def test_действия_без_цели_её_не_принимают(self):
+        for action in ("rotate_logs", "renew_certs", "vacuum_journal", "prune_builder"):
+            with self.subTest(action=action):
+                with self.assertRaises(catalog.RemedyError):
+                    catalog.resolve(action, "/var/log/nginx/error.log")
+
+    # --- Разрешения: новые действия -----------------------------------------
+
+    def test_остановленный_контейнер_поднимается(self):
+        with mock.patch.object(catalog, "stopped_containers", return_value={"svod-bot-1"}), \
+             mock.patch.object(catalog, "ignored_containers", return_value=[]):
+            cmd = catalog.resolve("start_container", "svod-bot-1")
+        # Именно start: compose up умеет тянуть образы и пересоздавать контейнер,
+        # а это уже другой класс полномочий.
+        self.assertEqual(cmd, ["docker", "start", "--", "svod-bot-1"])
+        self.assertNotIn("compose", " ".join(cmd))
+
+    def test_отметка_об_аварии_снимается(self):
+        with mock.patch.object(catalog, "failed_units", return_value={"report_bot.service"}):
+            cmd = catalog.resolve("reset_failed", "report_bot.service")
+        self.assertEqual(cmd, ["systemctl", "reset-failed", "--", "report_bot.service"])
+
+    def test_ротация_и_продление_целей_не_требуют(self):
+        """Действие без цели невозможно направить не туда — это и есть
+        причина, по которой три из четырёх новых её не принимают."""
+        self.assertEqual(catalog.resolve("rotate_logs"), ["logrotate", "-f", "/etc/logrotate.conf"])
+        self.assertEqual(catalog.resolve("renew_certs"), ["certbot", "renew"])
+
+    def test_у_продления_свой_потолок_времени(self):
+        """Общий потолок в 120 с продлению мал: оно ходит наружу по каждому
+        домену отдельно."""
+        self.assertGreater(catalog.ACTIONS["renew_certs"]["timeout"], catalog.CMD_TIMEOUT)
+
+    def test_исключения_читаются_из_root_овского_файла(self):
+        with mock.patch.object(catalog, "REMEDY_CONF", "/такого/файла/нет"):
+            self.assertEqual(catalog.ignored_containers(),
+                             list(catalog.DEFAULT_DOCKER_IGNORE))
+
     # --- Отказы: несуществующее действие ------------------------------------
 
     def test_действие_вне_каталога_отвергнуто(self):
@@ -97,11 +215,16 @@ class CatalogTest(unittest.TestCase):
         """Ни один построитель не должен возвращать строку: строка означала бы
         shell, а shell означал бы, что имя цели снова становится кодом."""
         with mock.patch.object(catalog, "failed_units", return_value={"a.service"}), \
-             mock.patch.object(catalog, "broken_containers", return_value={"c"}):
+             mock.patch.object(catalog, "broken_containers", return_value={"c"}), \
+             mock.patch.object(catalog, "stopped_containers", return_value={"c"}), \
+             mock.patch.object(catalog, "ignored_containers", return_value=[]):
             for action_id, target in (("restart_unit", "a.service"),
                                       ("restart_container", "c"),
                                       ("prune_builder", None),
-                                      ("vacuum_journal", None)):
+                                      ("vacuum_journal", None),
+                                      ("reset_failed", "a.service"),
+                                      ("rotate_logs", None),
+                                      ("renew_certs", None)):
                 with self.subTest(action_id=action_id):
                     cmd = catalog.resolve(action_id, target)
                     self.assertIsInstance(cmd, list)
@@ -110,7 +233,9 @@ class CatalogTest(unittest.TestCase):
     def test_каталог_для_модели_не_раскрывает_команд(self):
         """Модель видит смысл действий, но не то, во что они разворачиваются."""
         text = catalog.describe_for_model()
-        for leak in ("systemctl", "docker builder", "journalctl", "--vacuum"):
+        for leak in ("systemctl", "docker builder", "journalctl", "--vacuum",
+                     "reset-failed", "docker start", "logrotate", "certbot",
+                     "/etc/logrotate.conf"):
             self.assertNotIn(leak, text)
 
 

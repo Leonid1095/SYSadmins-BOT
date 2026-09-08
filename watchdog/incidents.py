@@ -21,7 +21,9 @@ REMEDY = "/usr/local/sbin/watchdog-remedy"
 # всё, что не подходит, до файловой системы не доходит.
 INCIDENT_RE = re.compile(r"^\d{8}T\d{6}Z(?:-\d{1,3})?$")
 
-REMEDY_TIMEOUT = 150
+# Хватать должно на самое долгое действие каталога — продление сертификатов
+# ходит к внешнему сервису по каждому домену отдельно (у него свой потолок 240 с).
+REMEDY_TIMEOUT = 300
 
 
 class IncidentError(Exception):

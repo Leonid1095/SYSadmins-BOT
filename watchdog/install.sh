@@ -50,6 +50,23 @@ install -d -m 755 -o root -g root /usr/local/lib/watchdog
 install -m 644 -o root -g root "$REPO/watchdog/catalog.py"       /usr/local/lib/watchdog/catalog.py
 install -m 755 -o root -g root "$REPO/watchdog/remedy-helper.py" /usr/local/sbin/watchdog-remedy
 
+# Какие контейнеры каталог не поднимает. Значение берём из monitor.local.conf,
+# чтобы источник правды остался один, но кладём в root-овский файл: политику
+# для того, что исполняется от root, не должен задавать файл в домашнем
+# каталоге. Владелец правит monitor.local.conf и переустанавливает.
+DOCKER_IGNORE_VALUE="$(sed -n 's/^\s*DOCKER_IGNORE="\([^"]*\)".*/\1/p' \
+    "$REPO/monitor.local.conf" 2>/dev/null | tail -1)"
+DOCKER_IGNORE_VALUE="${DOCKER_IGNORE_VALUE:-civ4col-pitboss*}"
+TMP_CONF="$(mktemp)"
+cat > "$TMP_CONF" <<EOF
+# Политика каталога починок. Читается /usr/local/lib/watchdog/catalog.py от root.
+# Правится через monitor.local.conf + переустановку, а не здесь.
+DOCKER_IGNORE="$DOCKER_IGNORE_VALUE"
+EOF
+install -m 644 -o root -g root "$TMP_CONF" /etc/watchdog-remedy.conf
+rm -f "$TMP_CONF"
+echo "   контейнеры вне починок: $DOCKER_IGNORE_VALUE"
+
 echo "▸ Правила sudoers"
 TMP_SUDO="$(mktemp)"
 cat > "$TMP_SUDO" <<EOF

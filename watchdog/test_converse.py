@@ -290,7 +290,11 @@ class GoodNewsCostsNothing(unittest.TestCase):
         self.assertIn("site.ru", v["explanation"])
 
     def test_strong_model_only_on_crit(self):
-        self.assertIsNone(self.analyst._crit_model([{"severity": "warn"}]))
+        """Выбор модели целиком проверяется в test_analyst.py; здесь остаётся
+        одно утверждение — что без крита подниматься не на что."""
+        import sandbox
+        self.assertEqual(self.analyst.choose_model([{"severity": "warn"}])["model"],
+                         sandbox.MODEL)
 
 
 if __name__ == "__main__":

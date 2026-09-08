@@ -15,6 +15,7 @@
 SSH и пользователей сюда не входят и входить не должны.
 """
 
+import fnmatch
 import re
 import subprocess
 
@@ -32,6 +33,16 @@ UNIT_DENY = re.compile(
 )
 
 CMD_TIMEOUT = 120
+
+# Контейнеры, чья остановка — норма. Комнаты civ4col гасятся сами через
+# полчаса; «поднять» такую значит спорить с её же устройством.
+#
+# Список берётся из root-овского файла, а не из monitor.local.conf в домашнем
+# каталоге: этот модуль исполняется от root, и политику ему должен задавать
+# файл, который правится шагом установки. install.sh переносит туда значение
+# из monitor.local.conf, так что источник правды остаётся один.
+REMEDY_CONF = "/etc/watchdog-remedy.conf"
+DEFAULT_DOCKER_IGNORE = ("civ4col-pitboss*",)
 
 
 class RemedyError(Exception):
@@ -55,20 +66,54 @@ def failed_units():
     return {line.split()[0] for line in out.splitlines() if line.strip()}
 
 
-def broken_containers():
-    """Контейнеры не в порядке прямо сейчас."""
+def ignored_containers():
+    """Шаблоны имён, которые каталог не трогает."""
+    try:
+        with open(REMEDY_CONF, encoding="utf-8") as f:
+            text = f.read()
+    except OSError:
+        return list(DEFAULT_DOCKER_IGNORE)
+    match = re.search(r'^\s*DOCKER_IGNORE="([^"]*)"', text, re.MULTILINE)
+    return match.group(1).split() if match else list(DEFAULT_DOCKER_IGNORE)
+
+
+def _container_rows():
+    """Имя → (состояние, статус) для всех контейнеров, включая остановленные."""
     out = _run(["docker", "ps", "-a", "--format", "{{.Names}}\t{{.State}}\t{{.Status}}"])
+    rows = {}
     if out is None:
-        return set()
-    broken = set()
+        return rows
     for line in out.splitlines():
         parts = line.split("\t")
-        if len(parts) != 3:
-            continue
-        name, state, status = parts
-        if state != "running" or "unhealthy" in status.lower():
-            broken.add(name)
-    return broken
+        if len(parts) == 3:
+            rows[parts[0]] = (parts[1], parts[2])
+    return rows
+
+
+def broken_containers():
+    """Контейнеры не в порядке прямо сейчас."""
+    return {name for name, (state, status) in _container_rows().items()
+            if state != "running" or "unhealthy" in status.lower()}
+
+
+# Контейнер, вышедший с нулевым кодом, сделал свою работу и закончил — так
+# живут разовые задачи. Поднимать такой значит выполнить её ещё раз, и это не
+# «обратимо с предсказуемыми последствиями»: на этой машине под описание
+# попадает svod-migrate-1, миграция базы. Найдено на живом инвентаре до
+# первого нажатия кнопки.
+CLEAN_EXIT_RE = re.compile(r"^Exited \(0\)")
+
+
+def stopped_containers():
+    """Контейнеры, которые именно стоят и которые имеет смысл поднимать.
+
+    Отдельно от broken_containers: перезапускать больной и поднимать стоящий —
+    разные действия, и путать их нельзя. Контейнер в restarting уже пытается
+    подняться сам, а вышедший с кодом 0 — не сломался, а закончил.
+    """
+    return {name for name, (state, status) in _container_rows().items()
+            if state in ("exited", "created", "dead")
+            and not CLEAN_EXIT_RE.match(status.strip())}
 
 
 # --- Построители команд -----------------------------------------------------
@@ -107,6 +152,54 @@ def _vacuum_journal(target):
     return ["journalctl", "--vacuum-time=7d"]
 
 
+def _start_container(target):
+    # Именно start, а НЕ compose up: последний умеет тянуть образы и
+    # пересоздавать контейнер, то есть менять то, что запущено. Это другой
+    # класс полномочий, и в каталоге ему не место.
+    if not target or not CONTAINER_RE.match(target):
+        raise RemedyError(f"Недопустимое имя контейнера: {target!r}")
+    if any(fnmatch.fnmatch(target, p) for p in ignored_containers()):
+        raise RemedyError(f"Контейнер {target} останавливается штатно — поднимать не нужно")
+    if target not in stopped_containers():
+        # Отказ обязан говорить правду о причине. «Не остановлен» про
+        # завершившуюся миграцию — это неверный диагноз, а неверный диагноз
+        # владелец принимает за факт: ровно так сегодня уже вышло с ключом
+        # агента, где ответ моста выдавался за ответ агента.
+        state, status = _container_rows().get(target, (None, ""))
+        if state is None:
+            raise RemedyError(f"Контейнера {target} на машине нет")
+        if CLEAN_EXIT_RE.match(status.strip()):
+            raise RemedyError(f"Контейнер {target} завершился сам с кодом 0 — "
+                              f"это разовая задача, а не поломка")
+        raise RemedyError(f"Контейнер {target} сейчас работает — поднимать нечего")
+    return ["docker", "start", "--", target]
+
+
+def _reset_failed(target):
+    # Чистая бухгалтерия: снимаем отметку об аварии, после чего юнит снова
+    # может подняться по своей же политике перезапуска. Ничего не запускаем.
+    if not target or not UNIT_RE.match(target):
+        raise RemedyError(f"Недопустимое имя юнита: {target!r}")
+    if UNIT_DENY.match(target):
+        raise RemedyError(f"{target} в постоянном запрете: чинить только руками")
+    if target not in failed_units():
+        raise RemedyError(f"{target} сейчас не в состоянии failed — снимать нечего")
+    return ["systemctl", "reset-failed", "--", target]
+
+
+def _rotate_logs(target):
+    # Взято вместо «усечь лог»: у того целью был бы путь, названный моделью, а
+    # ротация — штатный механизм, и ничего не теряет.
+    return ["logrotate", "-f", "/etc/logrotate.conf"]
+
+
+def _renew_certs(target):
+    # Идемпотентно: без готовых к продлению сертификатов ничего не делает.
+    # Закрывает реальный случай — остаток упал ниже 30 дней, значит
+    # автопродление сломалось и его надо подтолкнуть руками.
+    return ["certbot", "renew"]
+
+
 ACTIONS = {
     "nothing": {
         "title": "Ничего не делать",
@@ -138,6 +231,37 @@ ACTIONS = {
         "target": None,
         "build": _vacuum_journal,
     },
+    "start_container": {
+        "title": "Поднять контейнер",
+        "purpose": "Запустить остановленный контейнер как есть, без пересборки "
+                   "и без обновления образа. Только тот, что сейчас стоит.",
+        "target": "container",
+        "build": _start_container,
+    },
+    "reset_failed": {
+        "title": "Снять отметку об аварии",
+        "purpose": "Дать юниту, помеченному как failed, снова подниматься по "
+                   "своей политике перезапуска. Сам ничего не запускает.",
+        "target": "unit",
+        "build": _reset_failed,
+    },
+    "rotate_logs": {
+        "title": "Провернуть ротацию логов",
+        "purpose": "Освободить диск штатным механизмом, ничего не удаляя сверх "
+                   "того, что уже разрешено настройками.",
+        "target": None,
+        "build": _rotate_logs,
+    },
+    "renew_certs": {
+        "title": "Продлить сертификаты",
+        "purpose": "Подтолкнуть продление сертификатов, если автоматическое "
+                   "сломалось. Ничего не делает, когда продлевать нечего.",
+        "target": None,
+        "build": _renew_certs,
+        # Продление ходит к внешнему сервису и по каждому домену отдельно,
+        # поэтому общего потолка ему мало.
+        "timeout": 240,
+    },
 }
 
 
@@ -167,11 +291,12 @@ def execute(action_id, target=None):
     cmd = resolve(action_id, target)
     if cmd is None:
         return {"ok": True, "action": action_id, "output": "Действий не предпринято."}
+    timeout = ACTIONS[action_id].get("timeout", CMD_TIMEOUT)
     try:
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=CMD_TIMEOUT)
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
     except subprocess.TimeoutExpired:
         return {"ok": False, "action": action_id,
-                "output": f"Команда не уложилась в {CMD_TIMEOUT} c."}
+                "output": f"Команда не уложилась в {timeout} c."}
     output = (r.stdout + r.stderr).strip() or "(команда отработала молча)"
     return {"ok": r.returncode == 0, "action": action_id, "target": target,
             "output": output[:1500]}
