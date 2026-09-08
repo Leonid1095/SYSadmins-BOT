@@ -11,6 +11,7 @@
 в разделе "errors".
 """
 
+import concurrent.futures
 import json
 import os
 import re
@@ -27,9 +28,20 @@ from datetime import datetime, timezone
 # зависший smartctl не должен наложиться на следующий запуск.
 CMD_TIMEOUT = 15
 NET_TIMEOUT = 8
+# Обходной маршрут до удалённых агентов идёт через VPN и заметно медленнее:
+# измеренный ответ приходил за ~17 секунд. Прямой путь оставляем быстрым, чтобы
+# не ждать впустую там, где связи просто нет.
+REMOTE_DIRECT_TIMEOUT = 8
+REMOTE_PROXY_TIMEOUT = 40
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 LOCAL_CONF = os.path.join(BASE_DIR, "monitor.local.conf")
+DATA_DIR = os.environ.get("BOT_DATA_DIR", BASE_DIR)
+USERS_FILE = os.path.join(DATA_DIR, "users.json")
+OWNER_ID = os.environ.get("OWNER_ID", "")
+
+sys.path.insert(0, BASE_DIR)
+import agent_auth  # noqa: E402 — подпись запросов к агентам
 
 
 def _run_priv(cmd, timeout=CMD_TIMEOUT):
@@ -253,6 +265,105 @@ class Collector:
         expires = datetime.strptime(not_after, "%b %d %H:%M:%S %Y %Z").replace(tzinfo=timezone.utc)
         return (expires - datetime.now(timezone.utc)).days
 
+    def remote(self):
+        """Серверы владельца, опрашиваемые через их агентов.
+
+        До этого удалённые серверы не мониторил никто: monitor.sh следит только
+        за локальной машиной, а monitor_remote.py по устройству пропускал
+        владельца. Получалось, что чем сервер важнее, тем меньше о нём известно.
+        """
+        servers = self._owner_servers()
+        if not servers:
+            return None
+
+        targets = {name: info for name, info in servers.items()
+                   if info.get("server_ip") and info.get("secret_key")}
+        if not targets:
+            return None
+
+        # Опрашиваем параллельно. Последовательно два молчащих сервера съедали
+        # минуту на одних таймаутах, и снимок переставал быть снимком: к концу
+        # обхода начало уже устаревало.
+        out = {}
+        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+            futures = {
+                pool.submit(self._probe_agent, info["server_ip"], info["secret_key"]): name
+                for name, info in targets.items()
+            }
+            for future in concurrent.futures.as_completed(futures):
+                name = futures[future]
+                try:
+                    out[name] = future.result()
+                except Exception as exc:
+                    out[name] = {"ip": targets[name]["server_ip"], "reachable": False,
+                                 "error": f"опрос сорвался: {type(exc).__name__}"}
+        return out or None
+
+    def _probe_agent(self, ip, key):
+        """Опрашивает агента, пробуя оба пути до него.
+
+        Часть серверов у провайдера владельца напрямую недостижима, но
+        открывается через тот же мост, которым ходит бот. Пробуем сначала
+        напрямую — так быстрее и честнее, — и лишь потом через прокси,
+        запоминая, что сработало: это половина ответа на вопрос «почему молчит».
+        """
+        entry = {"ip": ip}
+        proxy = os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy")
+        routes = [("напрямую",
+                   urllib.request.build_opener(urllib.request.ProxyHandler({})),
+                   REMOTE_DIRECT_TIMEOUT)]
+        if proxy:
+            routes.append(("через прокси",
+                           urllib.request.build_opener(urllib.request.ProxyHandler(
+                               {"http": proxy, "https": proxy})),
+                           REMOTE_PROXY_TIMEOUT))
+
+        problems = []
+        for label, opener, timeout in routes:
+            headers = agent_auth.build_headers(key, "GET", "/status")
+            req = urllib.request.Request(f"http://{ip}:5000/status", headers=headers)
+            try:
+                with opener.open(req, timeout=timeout) as resp:
+                    data = json.loads(resp.read().decode())
+            except urllib.error.HTTPError as exc:
+                # Агент ответил, пусть и отказом: путь до него рабочий, искать
+                # другой незачем — проблема на самом сервере.
+                hint = {403: "агент не принял подпись (старая версия?)",
+                        503: "у агента не настроен ключ"}.get(exc.code, "")
+                entry.update({"reachable": False, "via": label, "http": exc.code,
+                              "error": f"агент отвечает {exc.code}"
+                                       + (f" — {hint}" if hint else "")})
+                return entry
+            except Exception as exc:
+                reason = getattr(exc, "reason", None) or type(exc).__name__
+                problems.append(f"{label}: {reason}")
+                continue
+
+            entry.update({
+                "reachable": True,
+                "via": label,
+                "disk_pct": float(data.get("disk", {}).get("percent", 0)),
+                "mem_pct": float(data.get("memory", {}).get("percent", 0)),
+                "cpu_pct": float(data.get("cpu", 0)),
+            })
+            if data.get("gpu"):
+                entry["gpu_temp"] = data["gpu"].get("temp")
+            return entry
+
+        entry.update({"reachable": False, "error": "; ".join(problems) or "нет связи"})
+        return entry
+
+    def _owner_servers(self):
+        """Серверы владельца из users.json. Чужие сторожа не касаются."""
+        if not OWNER_ID:
+            return {}
+        try:
+            with open(USERS_FILE, encoding="utf-8") as f:
+                users = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            return {}
+        return (users.get(str(OWNER_ID)) or {}).get("servers") or {}
+
     def security(self):
         """Активные баны — косвенный признак, что машину щупают активнее обычного."""
         out = {}
@@ -282,6 +393,7 @@ def collect():
     c.detect("smart", c.smart)
     c.detect("endpoints", c.endpoints)
     c.detect("security", c.security)
+    c.detect("remote", c.remote)
 
     snapshot = {
         "collected_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),

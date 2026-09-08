@@ -18,6 +18,9 @@ EnvironmentFile=/etc/telegram-server-bot.env
 Environment="HTTPS_PROXY=http://127.0.0.1:18443"
 Environment="HTTP_PROXY=http://127.0.0.1:18443"
 Environment="WATCHDOG_STATE_DIR=/var/lib/watchdog"
+# Список серверов владельца лежит рядом с данными бота; сторож читает его
+# по группе watchdog, чтобы опрашивать удалённых агентов.
+Environment="BOT_DATA_DIR=/var/lib/telegram-bot"
 
 # StateDirectory намеренно НЕ используется: он выставлял бы владельца по User и
 # Group юнита на каждом старте и стирал бы группу watchdog, через которую бот

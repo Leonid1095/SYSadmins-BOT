@@ -36,6 +36,14 @@ RISING = {
     ("cpu", "load_per_core_pct"): (150, 250),
     ("temperature", "cpu_c"): (80, 90),
 }
+# Пороги для удалённых серверов. Отдельно от локальных: там мы видим только
+# то, что отдал агент, и лезть глубже некуда.
+REMOTE_RISING = {
+    "disk_pct": (80, 90),
+    "mem_pct": (90, 95),
+    "cpu_pct": (85, 95),
+}
+
 CERT_DAYS = (30, 10)   # warn / crit — предупредить, пока продление ещё возможно
 DEADBAND = 3           # запас на выход из полосы вниз
 
@@ -194,6 +202,33 @@ class DeltaBuilder:
             self.bands[slot] = now
             self._emit("http", url, was, now, f"HTTP {code}" if code else "нет ответа")
 
+    def remote(self, facts):
+        """Доступность удалённых серверов и их метрики.
+
+        Недоступность — самое важное здесь: если агент молчит, всё остальное
+        про этот сервер мы всё равно не знаем.
+        """
+        for name, entry in (facts.get("remote") or {}).items():
+            slot = f"remote.{name}.reachable"
+            was = self.previous_bands.get(slot, "ok")
+            reachable = bool(entry.get("reachable"))
+            now = "ok" if reachable else "crit"
+            self.bands[slot] = now
+            detail = "агент отвечает" if reachable else (entry.get("error") or "агент молчит")
+            self._emit("remote", name, was, now, detail)
+
+            if not reachable:
+                continue
+            for field, (warn, crit) in REMOTE_RISING.items():
+                if field not in entry:
+                    continue
+                value = entry[field]
+                metric_slot = f"remote.{name}.{field}"
+                was = self.previous_bands.get(metric_slot, "ok")
+                band = rising_band(value, warn, crit, was)
+                self.bands[metric_slot] = band
+                self._emit("remote", name, was, band, f"{field}={value}")
+
     def smart(self, facts):
         for dev, verdict in (facts.get("smart") or {}).items():
             slot = f"smart.{dev}"
@@ -251,6 +286,7 @@ def compare(snapshot, state):
         builder.certificates(facts)
         builder.http(facts)
         builder.smart(facts)
+        builder.remote(facts)
         return [], builder.bands, True, builder.flap
 
     builder = DeltaBuilder(state.get("bands"), state.get("flap"))
@@ -258,6 +294,7 @@ def compare(snapshot, state):
     builder.certificates(facts)
     builder.http(facts)
     builder.smart(facts)
+    builder.remote(facts)
     builder.lists(state.get("facts", {}), facts, skip)
     return builder.events, builder.bands, False, builder.flap
 

@@ -115,6 +115,23 @@ def _smart_context(dev):
     return {f"smart-{os.path.basename(dev)}.txt": _capture(cmd)}
 
 
+def _remote_context(name):
+    """Что можно узнать об удалённом сервере, не имея на нём доступа.
+
+    Немного: жив ли порт и что отвечает агент. Логи оттуда не достать — по
+    этому поводу аналитик и должен советовать смотреть руками.
+    """
+    return {
+        f"remote-{name}-note.txt": (
+            "Сервер наблюдается только через агента, SSH-доступа у сторожа нет.\n"
+            "Подробности о состоянии смотри в facts.json → remote.\n"
+            "Если агент молчит: проверить, что bot-agent.service поднят, что порт\n"
+            "5000 открыт для этого сервера и что версия агента умеет проверять\n"
+            "подпись (старые ждут секрет в заголовке и отвечают 403/503)."
+        )
+    }
+
+
 GATHERERS = {
     "systemd": _unit_context,
     "docker": _container_context,
@@ -123,6 +140,7 @@ GATHERERS = {
     "cpu": _cpu_context,
     "http": _http_context,
     "smart": _smart_context,
+    "remote": _remote_context,
 }
 
 

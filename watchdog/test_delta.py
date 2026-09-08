@@ -30,8 +30,18 @@ BASE = {
         "docker": {"stopped": [], "unhealthy": [], "restarting": []},
         "smart": {"/dev/sda": "PASSED"},
         "endpoints": {"https://x.ru": {"http": 200, "cert_days": 80}},
+        "remote": {"впн": {"ip": "10.0.0.1", "reachable": True, "via": "напрямую",
+                           "disk_pct": 40.0, "mem_pct": 30.0, "cpu_pct": 5.0}},
     },
 }
+
+
+def remote(**changes):
+    """Состояние удалённого сервера с точечными правками."""
+    base = {"ip": "10.0.0.1", "reachable": True, "via": "напрямую",
+            "disk_pct": 40.0, "mem_pct": 30.0, "cpu_pct": 5.0}
+    base.update(changes)
+    return {"впн": base}
 
 
 def snapshot(**changes):
@@ -50,6 +60,8 @@ def snapshot(**changes):
         facts["endpoints"]["https://x.ru"]["cert_days"] = changes["cert_days"]
     if "smart" in changes:
         facts["smart"]["/dev/sda"] = changes["smart"]
+    if "remote" in changes:
+        facts["remote"] = changes["remote"]
     return snap
 
 
@@ -153,6 +165,39 @@ class DeltaTest(unittest.TestCase):
         self.run_delta(snapshot())
         events = self.events_of(snapshot(smart="FAILED"))
         self.assertEqual(events[0]["severity"], "crit")
+
+    # --- Удалённые серверы --------------------------------------------------
+
+    def test_замолчавший_агент_это_событие(self):
+        """До сторожа удалённые серверы не проверял никто: monitor.sh следит за
+        локальной машиной, а прежний monitor_remote.py пропускал владельца."""
+        self.run_delta(snapshot())
+        events = self.events_of(snapshot(remote=remote(
+            reachable=False, error="агент отвечает 503 — у агента не настроен ключ")))
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["kind"], "remote")
+        self.assertEqual(events[0]["severity"], "crit")
+        self.assertIn("503", events[0]["detail"])
+
+    def test_вернувшийся_агент_даёт_resolved(self):
+        self.run_delta(snapshot())
+        self.events_of(snapshot(remote=remote(reachable=False, error="молчит")))
+        events = self.events_of(snapshot(remote=remote()))
+        self.assertEqual(events[0]["severity"], "resolved")
+
+    def test_метрики_удалённого_сервера_в_полосах(self):
+        self.run_delta(snapshot())
+        events = self.events_of(snapshot(remote=remote(disk_pct=93.0)))
+        self.assertEqual([(e["kind"], e["severity"]) for e in events], [("remote", "crit")])
+
+    def test_у_молчащего_агента_метрики_не_проверяем(self):
+        """Цифры от недоступного сервера — вчерашние; сообщать по ним нечего,
+        кроме самой недоступности."""
+        self.run_delta(snapshot())
+        events = self.events_of(snapshot(remote=remote(
+            reachable=False, error="молчит", disk_pct=99.0)))
+        self.assertEqual(len(events), 1)
+        self.assertIn("молчит", events[0]["detail"])
 
     # --- Дребезг ------------------------------------------------------------
 
