@@ -11,6 +11,9 @@ import requests
 import sys
 import tempfile
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import agent_auth
+
 # Токен и OWNER_ID берём из единого источника config.py (в .gitignore),
 # с фолбэком на переменные окружения. Никакого хардкода секретов в этом файле.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -106,7 +109,7 @@ def main():
             try:
                 resp = requests.get(
                     f"http://{ip}:5000/status",
-                    headers={"X-Secret-Key": key},
+                    headers=agent_auth.build_headers(key, "GET", "/status"),
                     timeout=10
                 )
                 resp.raise_for_status()

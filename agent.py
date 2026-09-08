@@ -4,10 +4,17 @@ from flask import Flask, request, jsonify
 import psutil
 import subprocess
 import os
-import hmac
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from agent_auth import NonceCache, verify
 
 # Gunicorn получит эту переменную из systemd сервиса
 SECRET_KEY = os.getenv("SECRET_KEY")
+
+# Помнит недавние nonce, чтобы перехваченную подпись нельзя было повторить.
+# Гоняем агента одним воркером (см. install.sh) — кэш общий для всех запросов.
+NONCE_CACHE = NonceCache()
 
 # Эту переменную `app` ищет Gunicorn (из команды agent:app)
 app = Flask(__name__)
@@ -72,15 +79,24 @@ def get_gpu_info():
         return None
 
 @app.before_request
-def check_secret_key():
-    """Проверяет секретный ключ перед каждым запросом (для всех маршрутов)."""
-    # Если ключ не сконфигурирован — не пускаем никого (fail closed)
+def check_signature():
+    """Проверяет подпись запроса перед каждым маршрутом.
+
+    Раньше здесь принимался сам секрет заголовком X-Secret-Key. Агент отвечает
+    по обычному HTTP, поэтому любой на пути трафика получал готовый ключ и мог
+    опрашивать сервер сколько угодно. Теперь приходит только подпись, годная для
+    этого запроса и на две минуты; ключ машину не покидает.
+    """
+    # Ключ не сконфигурирован — не пускаем никого (fail closed)
     if not SECRET_KEY:
         return jsonify({"error": "SECRET_KEY is not configured on the agent"}), 503
-    # Константное по времени сравнение, чтобы исключить timing-атаку
-    provided = request.headers.get("X-Secret-Key", "")
-    if not hmac.compare_digest(provided, SECRET_KEY):
-        return jsonify({"error": "Invalid secret key"}), 403
+
+    ok, reason = verify(SECRET_KEY, request.method, request.path,
+                        request.headers, NONCE_CACHE)
+    if not ok:
+        # Причину называем: она не подсказывает ключ, а без неё разбирать
+        # рассинхрон часов на чужом сервере невозможно.
+        return jsonify({"error": reason}), 403
 
 @app.route('/status', methods=['GET'])
 def get_status():

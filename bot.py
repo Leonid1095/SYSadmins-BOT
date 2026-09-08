@@ -26,6 +26,7 @@ from telegram.ext import (
 )
 
 import config
+import agent_auth
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "watchdog"))
 import incidents  # noqa: E402  — мост между кнопками сторожа и root-исполнителем
@@ -287,7 +288,8 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     server_info = user_data['servers'][active_server_name]
     server_ip, secret_key = server_info['server_ip'], server_info['secret_key']
     url = f"http://{server_ip}:5000/status"
-    headers = {"X-Secret-Key": secret_key}
+    # Секрет не отправляем — только подпись этого запроса (см. agent_auth).
+    headers = agent_auth.build_headers(secret_key, "GET", "/status")
     
     try:
         response = await asyncio.to_thread(requests.get, url, headers=headers, timeout=10)
