@@ -299,5 +299,41 @@ class NewServerIsNotABreakage(unittest.TestCase):
         self.assertEqual([e["severity"] for e in builder.events], ["crit"])
 
 
+class ПервоеНаблюдениеСписка(unittest.TestCase):
+    """Новый детектор не должен выглядеть залпом свежих аварий.
+
+    Тот же принцип, что и для только что добавленного сервера (`ad6aa90`):
+    первое наблюдение — это база, а не поломка. Иначе включение любого нового
+    наблюдения означало бы пачку критов о том, что владелец и так знает, да ещё
+    и съело бы суточный лимит сильной модели.
+
+    И обратная сторона: если детектор в этот раз не отработал, его раздела в
+    фактах нет вовсе — молчание не равно «всё починилось».
+    """
+
+    FACTS = {"plgamesbot": {"banned": ["k1sume_qq"], "nomod": [], "no_signal": []}}
+
+    def events(self, previous, now):
+        builder = delta.DeltaBuilder({})
+        builder.lists(previous, now, delta.ignored())
+        return builder.events
+
+    def test_раздел_появился_впервые_молчим(self):
+        self.assertEqual(self.events({}, self.FACTS), [])
+
+    def test_дальше_ведёт_себя_как_обычно(self):
+        now = {"plgamesbot": {"banned": ["k1sume_qq", "shuranikola"],
+                              "nomod": [], "no_signal": []}}
+        self.assertEqual([e["key"] for e in self.events(self.FACTS, now)], ["shuranikola"])
+
+    def test_детектор_не_отработал_это_не_починка(self):
+        """Раздела нет в снимке — сказать нечего, а не «всё хорошо»."""
+        self.assertEqual(self.events(self.FACTS, {}), [])
+
+    def test_пустой_список_это_настоящая_починка(self):
+        """А вот раздел на месте и пустой — значит поломка действительно ушла."""
+        now = {"plgamesbot": {"banned": [], "nomod": [], "no_signal": []}}
+        self.assertEqual([e["severity"] for e in self.events(self.FACTS, now)], ["resolved"])
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

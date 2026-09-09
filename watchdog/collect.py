@@ -17,6 +17,7 @@ import os
 import re
 import shutil
 import socket
+import sqlite3
 import ssl
 import subprocess
 import sys
@@ -33,6 +34,15 @@ NET_TIMEOUT = 8
 # не ждать впустую там, где связи просто нет.
 REMOTE_DIRECT_TIMEOUT = 8
 REMOTE_PROXY_TIMEOUT = 40
+
+# PLGamesBot живёт на этой же машине. Пути — константы, а не конфиг: детектор
+# сам молчит там, где базы нет, и на чужом сервере ничего не стоит.
+PLGAMESBOT_DB = "/home/plg/PLGamesBot/plgamesbot.db"
+PLGAMESBOT_API = "http://127.0.0.1:8001"
+#: Сторож ходит раз в пять минут, поэтому его порог «нет сигнала» грубее
+#: продуктового (90 с): иначе снимок, попавший на перезапуск служб, объявил бы
+#: молчащими сразу всех.
+PLGAMESBOT_STALE_SEC = 300
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 LOCAL_CONF = os.path.join(BASE_DIR, "monitor.local.conf")
@@ -408,6 +418,108 @@ class Collector:
         return out or None
 
 
+    # --- PLGamesBot -------------------------------------------------------
+
+    def _plgamesbot_rows(self):
+        """Каналы с включённым ботом и то, что о них знает продукт.
+
+        Базу открываем только на чтение и через отдельное соединение: у неё
+        четыре живых писателя, и сторож не имеет права мешать ни одному.
+        """
+        uri = "file:%s?mode=ro" % PLGAMESBOT_DB
+        con = sqlite3.connect(uri, uri=True, timeout=CMD_TIMEOUT)
+        try:
+            return con.execute(
+                "SELECT s.twitch_username, s.is_stream_live, b.state, b.detail, "
+                "       b.send_error, b.is_mod, b.heartbeat_at "
+                "  FROM streamers s LEFT JOIN bot_status b ON b.streamer_id = s.twitch_id "
+                " WHERE s.is_bot_active = 1"
+            ).fetchall()
+        finally:
+            con.close()
+
+    def _plgamesbot_silent(self):
+        """Кто молчит и почему. Три причины, зритель их не различает.
+
+        Разбор нарочно свой, а не взятый у продукта: второе мнение имеет смысл
+        только полученное своим путём. Сломайся определение «молчит» внутри
+        PLGamesBot — его собственная самопроверка об этом не скажет.
+        """
+        banned, nomod, no_signal, live = [], [], [], set()
+        for name, is_live, state, detail, send_error, is_mod, heartbeat in self._plgamesbot_rows():
+            if not name:
+                continue
+            if is_live:
+                live.add(name)
+            reason = "%s %s" % (detail or "", send_error or "")
+            if state == "error" and "бан" in reason.lower():
+                banned.append(name)
+            elif state in ("connected", "error") and not is_mod:
+                # Без прав модератора бот молчит намеренно (решение 06.09.2026):
+                # для зрителя это неотличимо от бана.
+                nomod.append(name)
+            elif self._plgamesbot_stale(state, heartbeat):
+                no_signal.append(name)
+        return sorted(banned), sorted(nomod), sorted(no_signal), live
+
+    @staticmethod
+    def _plgamesbot_stale(state, heartbeat):
+        """Бот числится работающим, а отметок не шлёт."""
+        if state in (None, "stopped", "off"):
+            return False
+        if not heartbeat:
+            return True
+        try:
+            seen = datetime.fromisoformat(str(heartbeat))
+        except ValueError:
+            return True
+        if seen.tzinfo is None:
+            seen = seen.replace(tzinfo=timezone.utc)
+        return (datetime.now(timezone.utc) - seen).total_seconds() > PLGAMESBOT_STALE_SEC
+
+    def plgamesbot(self):
+        """Каналы, где наш бот молчит: забанен, без прав модератора, без отметок.
+
+        04.09.2026 `k1sume_qq` забанила бота, и узнали мы об этом пятого числа
+        спустя пять дней — из разбора чужой аварии. Смена состояния здесь
+        должна доходить до владельца в тот же день.
+        """
+        if not os.path.exists(PLGAMESBOT_DB):
+            return None
+        banned, nomod, no_signal, _live = self._plgamesbot_silent()
+        return {"banned": banned, "nomod": nomod, "no_signal": no_signal}
+
+    def _http_json(self, url):
+        """GET мимо прокси — ручка своя и слушает localhost."""
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        req = urllib.request.Request(url, headers={"User-Agent": "watchdog/1.0"})
+        with opener.open(req, timeout=NET_TIMEOUT) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+
+    def plgamesbot_public(self):
+        """Держится ли правило: молчащий канал не показываем, пока он в эфире.
+
+        Проверка сквозная намеренно. Что продукт прячет такие каналы, знают его
+        тесты; здесь мы дёргаем боевую ручку и сверяем её ответ с базой —
+        иначе сломанный фильтр найдётся не раньше следующей жалобы.
+
+        Отдельным списком — недоступность самой ручки: молчание проверки не
+        должно выглядеть как соблюдённое правило.
+        """
+        if not os.path.exists(PLGAMESBOT_DB):
+            return None
+        banned, nomod, no_signal, live = self._plgamesbot_silent()
+        silent = set(banned) | set(nomod) | set(no_signal)
+        try:
+            items = self._http_json(PLGAMESBOT_API + "/api/streams/live")
+        except Exception:
+            return {"advertised_silent": [], "unreachable": ["/api/streams/live"]}
+        shown = {str(i.get("twitch_username")) for i in items or [] if isinstance(i, dict)}
+        # `live` из базы здесь не фильтр, а страховка: в списке и так только
+        # те, кого продукт считает идущими в эфире.
+        return {"advertised_silent": sorted(shown & silent), "unreachable": []}
+
+
 def collect():
     c = Collector()
     c.detect("disk", c.disk)
@@ -420,6 +532,8 @@ def collect():
     c.detect("endpoints", c.endpoints)
     c.detect("security", c.security)
     c.detect("remote", c.remote)
+    c.detect("plgamesbot", c.plgamesbot)
+    c.detect("plgamesbot_public", c.plgamesbot_public)
 
     snapshot = {
         "collected_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),

@@ -17,7 +17,12 @@ Read по этому каталогу — инструмент, которым �
 
 import os
 import re
+import sqlite3
 import subprocess
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from collect import PLGAMESBOT_DB  # noqa: E402 — путь к базе определён один раз
 
 CMD_TIMEOUT = 20
 MAX_BYTES = 24_000   # хватает на разбор, но не топит контекст аналитика
@@ -132,6 +137,55 @@ def _remote_context(name):
     }
 
 
+CHANNEL_RE = re.compile(r"^[A-Za-z0-9_]{1,32}$")
+
+
+def _plgamesbot_context(name):
+    """Что известно про канал, где наш бот замолчал.
+
+    В каталоге действий сторожа нет и не может быть кнопки «попросить стримера
+    снять бан»: это чужой чат, туда нужны его руки. Поэтому полезный разбор
+    отвечает на два вопроса — что именно должен набрать стример и есть ли у нас
+    способ ему это сказать. Второй важнее: у большинства каналов Telegram не
+    привязан, и знание о бане остаётся нашим личным.
+    """
+    if not CHANNEL_RE.match(name or "") or not os.path.exists(PLGAMESBOT_DB):
+        return None
+    con = sqlite3.connect("file:%s?mode=ro" % PLGAMESBOT_DB, uri=True, timeout=CMD_TIMEOUT)
+    try:
+        cols = {r[1] for r in con.execute("PRAGMA table_info(streamers)")}
+        tg = "s.telegram_id" if "telegram_id" in cols else "NULL"
+        row = con.execute(
+            "SELECT s.twitch_username, s.is_stream_live, %s, "
+            "       b.state, b.detail, b.is_mod, b.heartbeat_at, b.last_cmd, b.last_cmd_at "
+            "  FROM streamers s LEFT JOIN bot_status b ON b.streamer_id = s.twitch_id "
+            " WHERE s.twitch_username = ?" % tg, (name,)).fetchone()
+    finally:
+        con.close()
+    if row is None:
+        return None
+
+    username, live, telegram, state, detail, is_mod, heartbeat, last_cmd, last_cmd_at = row
+    reach = ("Telegram привязан — можно написать в личку"
+             if telegram else
+             "Telegram не привязан — написать некому, остаётся объявление в кабинете")
+    lines = [
+        f"канал: {username}",
+        f"сейчас в эфире: {'да' if live else 'нет'}",
+        f"состояние бота: {state or 'нет записи'}",
+        f"подробность: {detail or '—'}",
+        f"права модератора: {'есть' if is_mod else 'НЕТ'}",
+        f"последняя отметка бота: {heartbeat or '—'}",
+        f"последняя отвеченная команда: {last_cmd or '—'} ({last_cmd_at or '—'})",
+        f"связь со стримером: {reach}",
+        "",
+        "Чинится не с нашей стороны: бан снимает сам стример командой "
+        "/unban plgames_bot, права модератора даёт /mod plgames_bot. "
+        "Действий каталога для этого нет и быть не может.",
+    ]
+    return {f"plgamesbot-{username}.txt": "\n".join(lines)}
+
+
 GATHERERS = {
     "systemd": _unit_context,
     "docker": _container_context,
@@ -141,6 +195,8 @@ GATHERERS = {
     "http": _http_context,
     "smart": _smart_context,
     "remote": _remote_context,
+    "plgamesbot": _plgamesbot_context,
+    "plgamesbot_public": _plgamesbot_context,
 }
 
 
