@@ -42,6 +42,7 @@ import time
 from datetime import datetime, timezone
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import delta   # noqa: E402 — названия состояний общие с уведомлением
 import notify  # noqa: E402 — доставка и разбор события общие с первым сообщением
 
 STATE_DIR = os.environ.get("WATCHDOG_STATE_DIR", "/var/lib/watchdog")
@@ -153,19 +154,18 @@ def still_broken(event, bands, facts):
 
 def movement(event, then_facts, now_facts):
     """Одна строка: сдвинулось ли что-нибудь с момента инцидента."""
-    kind = notify.KIND_NAME.get(event.get("kind"), event.get("kind", "?"))
+    subject = notify.subject_of(event)
     key = str(event.get("key") or "")
-    if event.get("kind") in notify.KIND_IS_THE_KEY or key == event.get("kind"):
-        subject = kind
-    else:
-        subject = f"{kind} {notify.KEY_NAME.get(key, key)}"
 
     list_field = event.get("list_field")
     if list_field:
         section = (now_facts.get(event.get("kind")) or {}).get(list_field) or []
         if key in section:
-            return f"{subject}: по-прежнему {list_field}"
-        return f"{subject}: вернулся в норму сам"
+            return f"{subject}: по-прежнему {delta.describe_list(list_field, False)}"
+        # Без «сам»: у службы и контейнера разный род, и приписка ломалась бы
+        # грамматикой на ровном месте. «Снова работает» и так говорит о том,
+        # что вмешательства не было.
+        return f"{subject}: {delta.describe_list(list_field, True)}"
 
     slot = event.get("slot")
     if not slot:
@@ -243,7 +243,7 @@ def humanize(seconds):
 
 def render_reminder(result, moves, elapsed, is_last):
     verdict = result["verdict"]
-    esc = html.escape
+    esc = notify.esc
     lines = [
         f"🔴 <b>Без ответа {humanize(elapsed)}</b>",
         "",
@@ -261,7 +261,7 @@ def render_reminder(result, moves, elapsed, is_last):
 
 
 def render_closed(result, elapsed):
-    esc = html.escape
+    esc = notify.esc
     return (
         f"🟢 <b>Закрылось само</b>\n\n"
         f"{esc(result['verdict']['headline'])}\n\n"

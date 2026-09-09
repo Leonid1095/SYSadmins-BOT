@@ -86,8 +86,31 @@ def describe(field, name, value):
         "used_pct": f"оперативной памяти занято {value}%",
         "load_per_core_pct": f"очередь к процессору {value}% от числа ядер",
         "cpu_c": f"температура процессора {value}°C",
+        # То же для удалённых серверов. Раньше их метрики уходили как
+        # «disk_pct=93» — тот же отладочный вывод, от которого избавлялись
+        # у локальных, просто в ветке, до которой не дошли руки.
+        "disk_pct": f"диск занят на {value}%",
+        "mem_pct": f"оперативной памяти занято {value}%",
+        "cpu_pct": f"процессор загружен на {value}%",
     }
     return texts.get(field, f"{field}={value}")
+
+
+# Как называется по-русски то, что мы нашли в списке. Сами имена полей —
+# внутренние: «Контейнер svod-bot-1 — стало плохо: stopped» выглядит выводом
+# отладчика, а не сообщением человеку.
+LIST_STATE = {
+    "failed": ("упала", "снова работает"),
+    "stopped": ("не запущен", "снова запущен"),
+    "unhealthy": ("работает, но проверка здоровья не проходит", "проверка здоровья снова проходит"),
+    "restarting": ("перезапускается по кругу", "перестал перезапускаться"),
+}
+
+
+def describe_list(field, recovered):
+    """Строка для события из списка — в нужную сторону."""
+    bad, good = LIST_STATE.get(field, (field, f"больше не {field}"))
+    return good if recovered else bad
 
 
 # --- Полосы -----------------------------------------------------------------
@@ -277,7 +300,7 @@ class DeltaBuilder:
             was = self.previous_bands.get(slot, "ok")
             now = falling_band(days, *CERT_DAYS)
             self.bands[slot] = now
-            self._emit("cert", url, was, now, f"осталось дней: {days}", slot=slot)
+            self._emit("cert", url, was, now, f"остаётся {days} дн.", slot=slot)
 
     def http(self, facts):
         for url, entry in (facts.get("endpoints") or {}).items():
@@ -314,8 +337,8 @@ class DeltaBuilder:
                 was = self.previous_bands.get(metric_slot, "ok")
                 band = rising_band(value, warn, crit, was)
                 self.bands[metric_slot] = band
-                self._emit("remote", name, was, band, f"{field}={value}",
-                           slot=metric_slot)
+                self._emit("remote", name, was, band,
+                           describe(field, name, value), slot=metric_slot)
 
     def smart(self, facts):
         for dev, verdict in (facts.get("smart") or {}).items():
@@ -323,7 +346,7 @@ class DeltaBuilder:
             was = self.previous_bands.get(slot, "ok")
             now = "ok" if verdict.upper() in ("PASSED", "OK") else "crit"
             self.bands[slot] = now
-            self._emit("smart", dev, was, now, f"SMART: {verdict}", slot=slot)
+            self._emit("smart", dev, was, now, f"самопроверка — {verdict}", slot=slot)
 
     def lists(self, previous_facts, facts, skip):
         """Списки сравниваем поимённо: замена одной поломки другой не должна
@@ -339,10 +362,11 @@ class DeltaBuilder:
             now = set((facts.get(section) or {}).get(field) or [])
             was, now = _drop_ignored(was, ignore), _drop_ignored(now, ignore)
             for item in sorted(now - was):
-                self._emit(section, item, "ok", severity, field, list_field=field)
+                self._emit(section, item, "ok", severity,
+                           describe_list(field, recovered=False), list_field=field)
             for item in sorted(was - now):
-                self._emit(section, item, severity, "ok", f"больше не {field}",
-                           list_field=field)
+                self._emit(section, item, severity, "ok",
+                           describe_list(field, recovered=True), list_field=field)
 
 
 def load_state():

@@ -280,7 +280,22 @@ class FollowupTest(unittest.TestCase):
     def test_движение_замечает_что_контейнер_поднялся_сам(self):
         event = {"kind": "docker", "key": "svod-bot-1", "list_field": "stopped"}
         text = followup.movement(event, {}, {"docker": {"stopped": []}})
-        self.assertIn("вернулся в норму сам", text)
+        self.assertIn("снова запущен", text)
+        # Состояние называется по-русски, а не именем внутреннего поля.
+        self.assertNotIn("stopped", text)
+
+    def test_движение_называет_состояние_словами(self):
+        event = {"kind": "systemd", "key": "report_bot.service", "list_field": "failed"}
+        still = followup.movement(event, {}, {"systemd": {"failed": ["report_bot.service"]}})
+        self.assertIn("по-прежнему упала", still)
+        self.assertNotIn("failed", still)
+
+    def test_удалённый_сервер_называется_своим_именем(self):
+        """«Удалённый сервер DE сервер» — не название, а склейка."""
+        event = {"kind": "remote", "key": "DE сервер", "slot": "remote.DE сервер.disk_pct"}
+        text = followup.movement(event, {"remote": {"DE сервер": {"disk_pct": 80}}},
+                                 {"remote": {"DE сервер": {"disk_pct": 93}}})
+        self.assertTrue(text.startswith("DE сервер:"), text)
 
     # --- Форма сообщения ----------------------------------------------------
 

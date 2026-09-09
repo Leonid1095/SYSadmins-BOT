@@ -14,6 +14,7 @@ root-хелпер, который заново всё проверит. Поэт
 import html
 import json
 import os
+import re
 import sys
 import urllib.error
 import urllib.parse
@@ -34,6 +35,31 @@ KIND_NAME = {
 # «Память: memory — ...» выглядела отладочным выводом, а не сообщением человеку.
 KIND_IS_THE_KEY = {"memory", "cpu", "temperature"}
 
+# А здесь наоборот: имя объекта владелец придумал сам, и оно говорит больше
+# любого нашего слова. «Удалённый сервер DE сервер» — не название, а склейка.
+KEY_IS_ENOUGH = {"remote"}
+
+# У сайтов и сертификатов ключ — полный URL. Схема и хвостовой слэш в строке
+# уведомления не несут ничего: домен и так узнаётся.
+def short_target(key):
+    return re.sub(r"^https?://", "", str(key)).rstrip("/")
+
+
+def subject_of(event):
+    """О чём эта строка — словами. Общее для уведомления и для напоминания,
+    иначе одно и то же событие называлось бы в них по-разному."""
+    kind_id = event.get("kind")
+    kind = KIND_NAME.get(kind_id, kind_id or "?")
+    key = str(event.get("key") or "")
+
+    if kind_id in KEY_IS_ENOUGH and key:
+        return key
+    if kind_id in KIND_IS_THE_KEY or key == kind_id or not key:
+        return kind
+    if kind_id in ("http", "cert"):
+        return f"{kind} {short_target(key)}"
+    return f"{kind} {KEY_NAME.get(key, key)}"
+
 # Внутренние имена целей, у которых есть человеческое название.
 KEY_NAME = {"root": "корневого раздела", "hdd": "с бэкапами"}
 
@@ -48,25 +74,28 @@ DIRECTION = {
 }
 
 
+def esc(value):
+    """Экранируем три символа, а не четыре: кавычка в тексте безвредна, а
+    &quot; вместо неё владелец читает как мусор в цитате из лога."""
+    return html.escape(str(value), quote=False)
+
+
 def describe_event(event):
     """Одна строка «что изменилось», написанная для человека."""
-    kind = KIND_NAME.get(event.get("kind"), event.get("kind", "?"))
     mark = SEVERITY_MARK.get(event.get("severity"), "•")
-    key = str(event.get("key") or "")
+    subject = f"<b>{esc(subject_of(event))}</b>"
 
-    if event.get("kind") in KIND_IS_THE_KEY or key == event.get("kind"):
-        subject = f"<b>{html.escape(kind)}</b>"
-    else:
-        subject = f"<b>{html.escape(kind)}</b> {html.escape(KEY_NAME.get(key, key))}"
-
-    where = DIRECTION.get(event.get("to") or event.get("severity"), "")
+    # У списочных событий направление уже сидит в самом описании: «упала»,
+    # «снова запущен». Приписывать к нему «стало плохо» — говорить дважды.
+    where = "" if event.get("list_field") else \
+        DIRECTION.get(event.get("to") or event.get("severity"), "")
     detail = str(event.get("detail") or "")
 
     line = f"{mark} {subject}"
     if where:
         line += f" — {where}"
     if detail:
-        line += f": {html.escape(detail)}"
+        line += f": {esc(detail)}"
     return line
 
 
@@ -99,7 +128,6 @@ def render(result):
     ровно три символа, и содержимое логов не превратит сообщение в кашу."""
     verdict = result["verdict"]
     mark = SEVERITY_MARK.get(verdict["severity"], "⚪️")
-    esc = html.escape
 
     lines = [f"{mark} <b>{esc(verdict['headline'])}</b>", ""]
     if verdict.get("explanation"):

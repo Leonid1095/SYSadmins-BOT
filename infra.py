@@ -33,7 +33,10 @@ def esc(value) -> str:
     Неэкранированный `<` ломает разметку целиком: Telegram отвечает 400, и
     владелец не видит сообщения вообще — ровно в тот момент, когда что-то упало.
     """
-    return html.escape(str(value))
+    # quote=False намеренно: кавычка внутри текста ничего не ломает, а
+    # html.escape по умолчанию превращает её в &quot; — и владелец видит
+    # мнемонику вместо кавычки в цитате из лога.
+    return html.escape(str(value), quote=False)
 
 STATE_FILE = os.path.join(
     os.environ.get("WATCHDOG_STATE_DIR", "/var/lib/watchdog"), "state.json")

@@ -101,7 +101,10 @@ def esc(value) -> str:
     В HTML экранировать нужно три символа, и сторож (watchdog/notify.py) уже
     пишет на нём — теперь обе половины бота говорят одинаково.
     """
-    return html.escape(str(value))
+    # quote=False намеренно: кавычка внутри текста ничего не ломает, а
+    # html.escape по умолчанию превращает её в &quot; — и владелец видит
+    # мнемонику вместо кавычки в цитате из лога.
+    return html.escape(str(value), quote=False)
 
 
 async def show(update: Update, text: str, reply_markup=None):
@@ -872,11 +875,11 @@ async def watchdog_option(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # логи, в которые пишет посторонний. Неэкранированный текст здесь либо ломал
     # разметку (Telegram отвечает 400, кнопка «молчит»), либо позволял вложить
     # в админский алерт чужую ссылку. В watchdog_execute это уже делалось.
-    target = (f" → <code>{html.escape(str(chosen['target']))}</code>"
+    target = (f" → <code>{esc(chosen['target'])}</code>"
               if chosen.get("target") else "")
     await query.edit_message_text(
-        f"{query.message.text_html}\n\n❓ <b>{html.escape(str(chosen['label']))}</b>{target}\n"
-        f"<i>{html.escape(str(chosen['why']))}</i>\n\nВыполнить?",
+        f"{query.message.text_html}\n\n❓ <b>{esc(chosen['label'])}</b>{target}\n"
+        f"<i>{esc(chosen['why'])}</i>\n\nВыполнить?",
         parse_mode='HTML', reply_markup=_remedy_keyboard(incident_id, index))
 
 
@@ -899,9 +902,9 @@ async def watchdog_execute(update: Update, context: ContextTypes.DEFAULT_TYPE):
     })
 
     mark = "✅" if outcome.get("ok") else "⛔️"
-    body = html.escape(str(outcome.get("output", ""))[:900])
+    body = esc(str(outcome.get("output", ""))[:900])
     await query.edit_message_text(
-        f"{query.message.text_html}\n\n{mark} <b>{html.escape(chosen['label'])}</b>\n"
+        f"{query.message.text_html}\n\n{mark} <b>{esc(chosen['label'])}</b>\n"
         f"<pre>{body}</pre>", parse_mode='HTML')
 
 
