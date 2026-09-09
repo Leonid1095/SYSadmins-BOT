@@ -320,12 +320,21 @@ class DeltaBuilder:
         """
         for name, entry in (facts.get("remote") or {}).items():
             slot = f"remote.{name}.reachable"
+            # Сервер, которого в прошлом снимке не было, — это не поломка, а
+            # первое наблюдение. Владелец добавляет его в бот ДО установки
+            # агента (бот на этом шаге и выдаёт команду установки), так что
+            # «недоступен» — ожидаемое состояние первых минут. Без этой
+            # оговорки добавление трёх серверов означало бы три критичных
+            # разбора подряд про то, что владелец и так делает руками.
+            # Это та же мысль, что и базовый снимок при первом запуске.
+            first_time = slot not in self.previous_bands
             was = self.previous_bands.get(slot, "ok")
             reachable = bool(entry.get("reachable"))
             now = "ok" if reachable else "crit"
             self.bands[slot] = now
             detail = "агент отвечает" if reachable else (entry.get("error") or "агент молчит")
-            self._emit("remote", name, was, now, detail, slot=slot)
+            if not first_time:
+                self._emit("remote", name, was, now, detail, slot=slot)
 
             if not reachable:
                 continue

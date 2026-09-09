@@ -16,6 +16,9 @@ import sys
 import tempfile
 import unittest
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import delta  # noqa: E402 — часть проверок обращается к сравнению напрямую
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 DELTA = os.path.join(HERE, "delta.py")
 
@@ -261,6 +264,39 @@ class DeltaTest(unittest.TestCase):
         self.run_delta(snapshot())
         events = self.events_of(snapshot(disk_pct=85, failed=["x.service"]))
         self.assertEqual(events[0]["severity"], "crit")
+
+
+class NewServerIsNotABreakage(unittest.TestCase):
+    """Только что добавленный сервер не должен будить модель.
+
+    Владелец добавляет сервер в бот ДО установки агента — бот на этом шаге и
+    выдаёт команду установки. Значит «недоступен» в первые минуты ожидаемо, и
+    три добавленных сервера означали бы три критичных разбора подряд про то,
+    что владелец делает прямо сейчас руками.
+    """
+
+    def facts(self, reachable):
+        return {"remote": {"Новый": {"reachable": reachable,
+                                     "error": None if reachable else "агент молчит"}}}
+
+    def test_первое_наблюдение_молчит(self):
+        builder = delta.DeltaBuilder({})
+        builder.remote(self.facts(False))
+        self.assertEqual(builder.events, [])
+        # Но состояние запомнено — иначе он молчал бы вечно.
+        self.assertEqual(builder.bands["remote.Новый.reachable"], "crit")
+
+    def test_дальше_ведёт_себя_как_обычно(self):
+        """Как только сервер попал в снимок, он подчиняется общим правилам."""
+        builder = delta.DeltaBuilder({"remote.Новый.reachable": "crit"})
+        builder.remote(self.facts(True))
+        self.assertEqual(len(builder.events), 1)
+        self.assertEqual(builder.events[0]["severity"], "resolved")
+
+    def test_знакомый_сервер_падает_как_прежде(self):
+        builder = delta.DeltaBuilder({"remote.Новый.reachable": "ok"})
+        builder.remote(self.facts(False))
+        self.assertEqual([e["severity"] for e in builder.events], ["crit"])
 
 
 if __name__ == "__main__":
