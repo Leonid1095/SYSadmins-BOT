@@ -235,7 +235,7 @@ class FollowupTest(unittest.TestCase):
             "memory": {"used_pct": 80, "swap_pct": 65},
             "smart": {"/dev/sda": "PASSED"},
             "endpoints": {"https://a.b.c/x": {"http": 502, "cert_days": 12}},
-            "remote": {"DE сервер": {"reachable": False, "disk_pct": 70}},
+            "remote": {"Второй сервер": {"reachable": False, "disk_pct": 70}},
         }
         cases = [
             ("disk.root.pct", 91),
@@ -244,8 +244,8 @@ class FollowupTest(unittest.TestCase):
             ("smart./dev/sda", "PASSED"),
             ("http.https://a.b.c/x", 502),
             ("cert.https://a.b.c/x", 12),
-            ("remote.DE сервер.reachable", False),
-            ("remote.DE сервер.disk_pct", 70),
+            ("remote.Второй сервер.reachable", False),
+            ("remote.Второй сервер.disk_pct", 70),
         ]
         for slot, expected in cases:
             with self.subTest(slot=slot):
@@ -285,17 +285,17 @@ class FollowupTest(unittest.TestCase):
         self.assertNotIn("stopped", text)
 
     def test_движение_называет_состояние_словами(self):
-        event = {"kind": "systemd", "key": "report_bot.service", "list_field": "failed"}
-        still = followup.movement(event, {}, {"systemd": {"failed": ["report_bot.service"]}})
+        event = {"kind": "systemd", "key": "demo-app.service", "list_field": "failed"}
+        still = followup.movement(event, {}, {"systemd": {"failed": ["demo-app.service"]}})
         self.assertIn("по-прежнему упала", still)
         self.assertNotIn("failed", still)
 
     def test_удалённый_сервер_называется_своим_именем(self):
-        """«Удалённый сервер DE сервер» — не название, а склейка."""
-        event = {"kind": "remote", "key": "DE сервер", "slot": "remote.DE сервер.disk_pct"}
-        text = followup.movement(event, {"remote": {"DE сервер": {"disk_pct": 80}}},
-                                 {"remote": {"DE сервер": {"disk_pct": 93}}})
-        self.assertTrue(text.startswith("DE сервер:"), text)
+        """«Удалённый сервер Второй сервер» — не название, а склейка."""
+        event = {"kind": "remote", "key": "Второй сервер", "slot": "remote.Второй сервер.disk_pct"}
+        text = followup.movement(event, {"remote": {"Второй сервер": {"disk_pct": 80}}},
+                                 {"remote": {"Второй сервер": {"disk_pct": 93}}})
+        self.assertTrue(text.startswith("Второй сервер:"), text)
 
     # --- Форма сообщения ----------------------------------------------------
 

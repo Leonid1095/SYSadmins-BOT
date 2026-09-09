@@ -266,5 +266,40 @@ class LocalHostIsNotAddedAsRemote(unittest.TestCase):
                 self.assertTrue(bot.is_valid_ip(addr))
 
 
+class CommandMenuTest(unittest.TestCase):
+    """Кнопка «Меню» рядом с полем ввода.
+
+    Бот пишет первым, и в чат, где последнее сообщение — уведомление недельной
+    давности, войти было нечем: приходилось помнить /start. Меню закрывает это,
+    но только если список команд и обработчики не разъезжаются.
+    """
+
+    def test_каждая_команда_имеет_описание_и_обработчик(self):
+        for name, description, handler in bot.COMMANDS:
+            with self.subTest(command=name):
+                # Telegram принимает только строчные латинские буквы, цифры и _
+                self.assertRegex(name, r"^[a-z0-9_]{1,32}$")
+                self.assertTrue(description.strip())
+                self.assertLessEqual(len(description), 256)
+                self.assertTrue(callable(handler()))
+
+    def test_start_на_месте(self):
+        """Единственная команда, без которой бот недоступен вообще."""
+        self.assertIn("start", [name for name, _, _ in bot.COMMANDS])
+
+    def test_команды_не_повторяются(self):
+        names = [name for name, _, _ in bot.COMMANDS]
+        self.assertEqual(len(names), len(set(names)))
+
+    def test_экраны_открываются_и_без_нажатия(self):
+        """Команда приходит без callback_query, и прежний
+        `update.callback_query.answer()` на ней падал бы."""
+        async def check():
+            update = MagicMock()
+            update.callback_query = None
+            await bot.ack(update)          # не должно бросить
+        asyncio.run(check())
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

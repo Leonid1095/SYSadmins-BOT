@@ -27,7 +27,14 @@ import html
 import ipaddress
 import tempfile
 from functools import wraps
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import (
+    BotCommand,
+    BotCommandScopeChat,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    MenuButtonCommands,
+    Update,
+)
 from telegram.error import BadRequest
 from telegram.ext import (
     Application,
@@ -105,6 +112,17 @@ def esc(value) -> str:
     # html.escape по умолчанию превращает её в &quot; — и владелец видит
     # мнемонику вместо кавычки в цитате из лога.
     return html.escape(str(value), quote=False)
+
+
+async def ack(update: Update, text: str | None = None):
+    """Гасит «часики» на кнопке, если экран открыли кнопкой.
+
+    Нужен, чтобы один и тот же экран открывался и нажатием, и командой из
+    меню: у команды нет callback_query, и прежний `update.callback_query.answer()`
+    на ней падал бы.
+    """
+    if update.callback_query:
+        await update.callback_query.answer(text)
 
 
 async def show(update: Update, text: str, reply_markup=None):
@@ -308,8 +326,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def host_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Состояние самой машины, на которой всё живёт."""
-    query = update.callback_query
-    await query.answer()
+    await ack(update)
     try:
         snapshot = infra.load_snapshot()
     except infra.SnapshotUnavailable as exc:
@@ -329,8 +346,7 @@ async def host_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def infra_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Сводка по инфраструктуре: что вообще крутится и что из этого сломано."""
-    query = update.callback_query
-    await query.answer()
+    await ack(update)
     try:
         snapshot = infra.load_snapshot()
     except infra.SnapshotUnavailable as exc:
@@ -380,9 +396,8 @@ async def infra_section(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # --- Удалённые серверы ------------------------------------------------------
 
 async def myservers_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    user_id = str(query.from_user.id)
+    await ack(update)
+    user_id = str(update.effective_user.id)
     user_data = load_users().get(user_id, {"servers": {}})
 
     if not user_data.get("servers"):
@@ -549,9 +564,8 @@ async def show_instructions_callback(update: Update, context: ContextTypes.DEFAU
 # --- Мониторинг ---
 
 async def monitoring_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    user_id = str(query.from_user.id)
+    await ack(update)
+    user_id = str(update.effective_user.id)
     user_sub = load_monitor_subs().get(user_id)
     is_subscribed = user_sub is not None and user_sub.get("enabled", False)
     settings = user_sub if user_sub else DEFAULT_MONITOR_SETTINGS.copy()
@@ -714,7 +728,7 @@ async def addserver_start(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     await show(update,
                "➕ <b>Новый сервер — шаг 1 из 2</b>\n\n"
                "Придумайте название, по которому вы его узнаете. Например: "
-               "<code>DE сервер</code> или <code>прокси-NL</code>.\n\n"
+               "<code>Второй сервер</code> или <code>прокси-NL</code>.\n\n"
                "Можно буквы, цифры, пробел, точку, дефис и подчёркивание, "
                "до 24 символов.\n\n"
                "Отменить — команда /cancel")
@@ -1019,6 +1033,22 @@ async def unhandled_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=get_main_menu_keyboard(), parse_mode='HTML')
 
 
+# Команды бота. Один список: по нему и вешаются обработчики, и заполняется
+# кнопка «Меню» рядом с полем ввода. Разъехаться они не могут — команда без
+# обработчика в меню не попадёт, а обработчик без описания не появится.
+#
+# Меню нужно ещё и потому, что бот пишет первым: в чат, где последнее сообщение
+# — уведомление недельной давности, войти было нечем, кроме как вспомнить /start.
+COMMANDS = [
+    ("start",   "Главное меню",                          lambda: start_command),
+    ("server",  "Этот сервер: диск, память, процессор",   lambda: host_menu),
+    ("infra",   "Инфраструктура: контейнеры, службы, сайты", lambda: infra_menu),
+    ("servers", "Удалённые серверы",                      lambda: myservers_menu),
+    ("alerts",  "Уведомления и пороги",                   lambda: monitoring_menu),
+    ("cancel",  "Отменить текущее действие",              lambda: cancel_conversation),
+]
+
+
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     logger.error("Ошибка при обработке update", exc_info=context.error)
 
@@ -1026,6 +1056,25 @@ async def post_init(application: Application):
     application.bot_data['repo_owner'] = 'Leonid1095'
     application.bot_data['repo_name'] = 'SYSadmins-BOT'
     logger.info("Данные о репозитории загружены.")
+
+    # Список команд и кнопка «Меню». Ставится при каждом старте: так правка
+    # списка в коде доезжает до чата сама, без ручного захода к @BotFather.
+    #
+    # Область — личный чат владельца. Глобальная выдала бы список команд всем,
+    # кто откроет бота, хотя отвечает он всё равно только владельцу: показывать
+    # постороннему меню, на которое он не получит ответа, незачем.
+    scope = BotCommandScopeChat(chat_id=int(config.OWNER_ID))
+    try:
+        await application.bot.set_my_commands(
+            [BotCommand(name, description) for name, description, _ in COMMANDS],
+            scope=scope)
+        await application.bot.set_chat_menu_button(
+            chat_id=int(config.OWNER_ID), menu_button=MenuButtonCommands())
+        logger.info("Меню команд обновлено: %s",
+                    ", ".join("/" + name for name, _, _ in COMMANDS))
+    except Exception as exc:
+        # Бот без меню работает, бот без запуска — нет.
+        logger.warning("Меню команд не установлено: %s", exc)
 
 def main():
     if not config.TELEGRAM_TOKEN:
@@ -1051,7 +1100,8 @@ def main():
         fallbacks=[CommandHandler("cancel", cancel_conversation)],
     )
     
-    application.add_handler(CommandHandler("start", start_command))
+    for name, _, handler in COMMANDS:
+        application.add_handler(CommandHandler(name, handler()))
     application.add_handler(CallbackQueryHandler(start_command, pattern='^menu_back$'))
 
     # Центральный сервер и его инфраструктура — из снимка сторожа.

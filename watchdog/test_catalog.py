@@ -164,9 +164,9 @@ class CatalogTest(unittest.TestCase):
         self.assertNotIn("compose", " ".join(cmd))
 
     def test_отметка_об_аварии_снимается(self):
-        with mock.patch.object(catalog, "failed_units", return_value={"report_bot.service"}):
-            cmd = catalog.resolve("reset_failed", "report_bot.service")
-        self.assertEqual(cmd, ["systemctl", "reset-failed", "--", "report_bot.service"])
+        with mock.patch.object(catalog, "failed_units", return_value={"demo-app.service"}):
+            cmd = catalog.resolve("reset_failed", "demo-app.service")
+        self.assertEqual(cmd, ["systemctl", "reset-failed", "--", "demo-app.service"])
 
     def test_ротация_и_продление_целей_не_требуют(self):
         """Действие без цели невозможно направить не туда — это и есть
@@ -199,9 +199,9 @@ class CatalogTest(unittest.TestCase):
     # --- Разрешения ---------------------------------------------------------
 
     def test_упавший_юнит_перезапускается(self):
-        with mock.patch.object(catalog, "failed_units", return_value={"report_bot.service"}):
-            cmd = catalog.resolve("restart_unit", "report_bot.service")
-        self.assertEqual(cmd, ["systemctl", "restart", "--", "report_bot.service"])
+        with mock.patch.object(catalog, "failed_units", return_value={"demo-app.service"}):
+            cmd = catalog.resolve("restart_unit", "demo-app.service")
+        self.assertEqual(cmd, ["systemctl", "restart", "--", "demo-app.service"])
 
     def test_сломанный_контейнер_перезапускается(self):
         with mock.patch.object(catalog, "broken_containers", return_value={"svod-bot-1"}):
