@@ -51,7 +51,10 @@ while [[ "$#" -gt 0 ]]; do
             [ -r "$2" ] || echo_error "Не читается файл ключа: $2"
             SECRET_KEY="$(tr -d '\r\n' < "$2")"; shift ;;
         --allow-from)
-            ALLOW_FROM="$2"; shift ;;
+            # Можно указать несколько раз или через запятую: центральный сервер
+            # ходит к агенту двумя маршрутами (напрямую и через мост), и наружу
+            # они выходят с РАЗНЫХ адресов. Один адрес закрыл бы второй маршрут.
+            ALLOW_FROM="${ALLOW_FROM:+$ALLOW_FROM,}$2"; shift ;;
         *) echo_error "Неизвестный параметр: $1" ;;
     esac
     shift
@@ -158,16 +161,21 @@ echo_success "Сервис агента запущен и добавлен в а
 if [ -n "$ALLOW_FROM" ]; then
     if command -v ufw >/dev/null 2>&1; then
         echo_info "Открываю порт 5000 только для $ALLOW_FROM..."
-        # Именно `insert 1`, а не `allow`: ufw проверяет правила по порядку и
-        # добавляет новые в КОНЕЦ. Если на сервере уже стоит запрет на 5000 —
-        # а на Риге он и стоял, — разрешение в конце списка не сработало бы
-        # никогда, и «правка применена» означало бы ровно ничего.
-        ufw --force delete allow from "$ALLOW_FROM" to any port 5000 proto tcp >/dev/null 2>&1 || true
-        ufw insert 1 allow from "$ALLOW_FROM" to any port 5000 proto tcp >/dev/null
+        IFS=',' read -ra ALLOW_LIST <<< "$ALLOW_FROM"
+        for SRC in "${ALLOW_LIST[@]}"; do
+            SRC="$(echo "$SRC" | tr -d '[:space:]')"
+            [ -n "$SRC" ] || continue
+            # Именно `insert 1`, а не `allow`: ufw проверяет правила по порядку и
+            # добавляет новые в КОНЕЦ. Если на сервере уже стоит запрет на 5000 —
+            # а на Риге он и стоял, — разрешение в конце списка не сработало бы
+            # никогда, и «правка применена» означало бы ровно ничего.
+            ufw --force delete allow from "$SRC" to any port 5000 proto tcp >/dev/null 2>&1 || true
+            ufw insert 1 allow from "$SRC" to any port 5000 proto tcp >/dev/null
+            echo_success "Разрешён доступ к порту 5000 с $SRC."
+        done
         # Всем остальным — запрет. Без него разрешение выше ничего не сужает,
         # если политика по умолчанию разрешающая.
         ufw deny 5000 >/dev/null 2>&1 || true
-        echo_success "Порт 5000 доступен только с $ALLOW_FROM."
     else
         echo_info "ufw не установлен — правило не добавлено. Закройте порт 5000 сами."
     fi
