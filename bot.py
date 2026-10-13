@@ -47,6 +47,7 @@ from telegram.ext import (
     TypeHandler,
     filters,
 )
+from telegram.request import HTTPXRequest
 
 import config
 import agent_auth
@@ -99,6 +100,48 @@ logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s
 # С уровнем WARNING в журнал попадают только сбои, без секрета в тексте лога.
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
+
+# --- Пульс опроса ---
+#
+# Сторож bot-alive-guard проверяет, что бот на самом деле опрашивает Telegram.
+# До 13.10.2026 он делал это собственным getUpdates тем же токеном — и ошибался:
+# короткий getUpdates сервер отдаёт сразу с "ok":true, даже когда бот исправно
+# висит в long polling, а 409 бывает лишь тогда, когда сторож сам сбивает опрос
+# бота (Conflict в журнале). Отсюда ~130 ложных перезапусков за сутки.
+#
+# Теперь бот сам сообщает о жизни: после каждого успешного ответа на getUpdates
+# обновляется время изменения этого файла. Long polling возвращается не реже раза
+# в ~10 с, так что у живого бота пульс свежий; у зависшего — протухает.
+HEARTBEAT_FILE = os.path.join(DATA_DIR, "poll-heartbeat")
+_heartbeat_warned = False
+
+
+def touch_poll_heartbeat() -> None:
+    """Отметить успешный цикл опроса. Ошибка записи не должна мешать опросу."""
+    global _heartbeat_warned
+    try:
+        try:
+            os.utime(HEARTBEAT_FILE)
+        except FileNotFoundError:
+            open(HEARTBEAT_FILE, "a").close()
+    except OSError as exc:
+        if not _heartbeat_warned:
+            _heartbeat_warned = True
+            logger.warning("Пульс опроса не записан (%s): сторож сочтёт бота зависшим", exc)
+
+
+class PollHeartbeatRequest(HTTPXRequest):
+    """Транспорт для getUpdates (и только для него — так делит запросы сам PTB):
+    после каждого успешного ответа Telegram отмечает пульс опроса.
+
+    Ошибки (409 Conflict, таймаут, сбой сети) пролетают исключением мимо отметки,
+    так что пульс означает ровно «Telegram только что отдал боту обновления».
+    """
+
+    async def post(self, *args, **kwargs):
+        result = await super().post(*args, **kwargs)
+        touch_poll_heartbeat()
+        return result
 
 # --- Вспомогательные функции ---
 
@@ -1089,7 +1132,12 @@ def main():
         logger.error("OWNER_ID не задан — бот не знает, кого пускать, и не стартует")
         return
 
-    application = Application.builder().token(config.TELEGRAM_TOKEN).post_init(post_init).build()
+    # connection_pool_size=1 — как у транспорта getUpdates, который PTB строит сам.
+    application = (Application.builder()
+                   .token(config.TELEGRAM_TOKEN)
+                   .get_updates_request(PollHeartbeatRequest(connection_pool_size=1))
+                   .post_init(post_init)
+                   .build())
     application.add_error_handler(error_handler)
 
     # Группа -1: отсечка посторонних до всех остальных обработчиков.
