@@ -41,6 +41,8 @@ HOSTNAME=$(hostname)
 # --- Пороги и цели по умолчанию (можно переопределить в monitor.local.conf) ---
 DISK_WARN=80          # % диска / — предупреждение
 DISK_CRIT=90          # % диска / — критично
+DISK_EMERG=95         # % диска / — авария: шлём мимо сторожа и напоминаем
+DISK_REMIND_SEC=21600 # напоминание об аварии, пока она длится (6 ч)
 HDD_MOUNT="/mnt/hdd"  # точка монтирования HDD бэкапов ("" чтобы отключить)
 HDD_WARN=85
 RAM_WARN=90           # % RAM
@@ -239,6 +241,26 @@ else
     clear_mark "disk_warning"; clear_mark "disk_critical"
 fi
 
+# --- 1.1 ДИСК (/): аварийная полоса ---
+# И блок выше, и сторож сообщают о переходе в «критично» один раз и дальше
+# молчат: 13.10.2026 диск дошёл до 96% без единого напоминания, а с 100%
+# начинают падать базы. Выше DISK_EMERG шлём сами, мимо сторожа: при каждом
+# новом проценте и не реже раза в DISK_REMIND_SEC, пока не освободят место.
+DISK_EMERG_FILE="$STATE_DIR/disk_emerg_last"   # «<epoch> <процент>» последней тревоги
+if [ -n "$DISK_PERCENT" ] && [ "$DISK_PERCENT" -ge "$DISK_EMERG" ]; then
+    disk_last_ts=""; disk_last_pct=""
+    [ -r "$DISK_EMERG_FILE" ] && read -r disk_last_ts disk_last_pct < "$DISK_EMERG_FILE"
+    disk_now_ts=$(date +%s)
+    if [ -z "$disk_last_ts" ] || [ "$DISK_PERCENT" -gt "${disk_last_pct:-0}" ] \
+       || [ $(( disk_now_ts - disk_last_ts )) -ge "$DISK_REMIND_SEC" ]; then
+        DISK_FREE_H=$(df -h / | awk 'NR==2{print $4}')
+        add_alert_own "🆘 <b>Диск заполнен на ${DISK_PERCENT}%</b>, свободно ${DISK_FREE_H}. На 100% встанут базы и сервисы. Что растёт: <code>sudo du -xh --max-depth=2 / | sort -rh | head</code>, <code>docker system df</code>. Напомню через $((DISK_REMIND_SEC / 3600)) ч или при следующем проценте."
+        echo "$disk_now_ts $DISK_PERCENT" > "$DISK_EMERG_FILE"
+    fi
+elif [ -n "$DISK_PERCENT" ] && [ "$DISK_PERCENT" -lt $(( DISK_EMERG - 2 )) ]; then
+    rm -f "$DISK_EMERG_FILE"   # запас в 2% — чтобы не дребезжать на границе
+fi
+
 # --- 2. HDD бэкапов ---
 if [ -n "$HDD_MOUNT" ]; then
     HDD_PERCENT=$(df "$HDD_MOUNT" 2>/dev/null | awk 'NR==2{gsub("%","",$5); print $5}')
@@ -379,6 +401,15 @@ while read -r unit; do
         mark_sent "failed_${unit}"
     fi
 done < <(systemctl list-units --type=service --state=failed --no-legend --plain 2>/dev/null | awk '{print $1}')
+
+# Метку упавшей службы снимаем, когда служба поднялась. Без этого повторное
+# падение той же службы не давало тревоги никогда: на 13.10.2026 так висели
+# failed_watchdog и failed_nvidia-persistenced, давно живые.
+FAILED_NOW=$(systemctl list-units --type=service --state=failed --no-legend --plain 2>/dev/null | awk '{print $1}')
+while read -r mark; do
+    [ -n "$mark" ] || continue
+    grep -qxF "${mark#failed_}" <<< "$FAILED_NOW" || clear_mark "$mark"
+done < <(grep '^failed_' "$STATE_FILE" 2>/dev/null)
 
 # --- 8. DOCKER: все контейнеры (авто-покрытие всех проектов) ---
 if command -v docker &> /dev/null; then
