@@ -466,9 +466,12 @@ class Collector:
         uri = "file:%s?mode=ro" % PLGAMESBOT_DB
         con = sqlite3.connect(uri, uri=True, timeout=CMD_TIMEOUT)
         try:
+            # Начало эфира — ради спящего бота: проснуться он должен с эфиром
             return con.execute(
                 "SELECT s.twitch_username, s.is_stream_live, b.state, b.detail, "
-                "       b.send_error, b.is_mod, b.heartbeat_at "
+                "       b.send_error, b.is_mod, b.heartbeat_at, "
+                "       (SELECT max(t.stream_started_at) FROM stream_statistics t "
+                "         WHERE t.streamer_id = s.twitch_id AND t.platform = 'twitch') "
                 "  FROM streamers s LEFT JOIN bot_status b ON b.streamer_id = s.twitch_id "
                 " WHERE s.is_bot_active = 1"
             ).fetchall()
@@ -483,26 +486,53 @@ class Collector:
         PLGamesBot — его собственная самопроверка об этом не скажет.
         """
         banned, nomod, no_signal, live = [], [], [], set()
-        for name, is_live, state, detail, send_error, is_mod, heartbeat in self._plgamesbot_rows():
+        for (name, is_live, state, detail, send_error, is_mod, heartbeat,
+             started) in self._plgamesbot_rows():
             if not name:
                 continue
             if is_live:
                 live.add(name)
             reason = "%s %s" % (detail or "", send_error or "")
-            if state == "error" and "бан" in reason.lower():
+            if state in ("error", "sleeping") and "бан" in reason.lower():
                 banned.append(name)
-            elif state in ("connected", "error") and not is_mod:
+            elif state in ("connected", "error", "sleeping") and not is_mod:
                 # Без прав модератора бот молчит намеренно (решение 06.09.2026):
                 # для зрителя это неотличимо от бана.
                 nomod.append(name)
+            elif state == "sleeping":
+                if self._plgamesbot_overslept(is_live, started):
+                    no_signal.append(name)
             elif self._plgamesbot_stale(state, heartbeat):
                 no_signal.append(name)
         return sorted(banned), sorted(nomod), sorted(no_signal), live
 
     @staticmethod
+    def _plgamesbot_overslept(is_live, started):
+        """Бот спит, а эфир идёт дольше, чем нужно, чтобы его разбудить.
+
+        С 25.10.2026 бот канала вне эфира не сидит в чате: процесса нет,
+        отметок нет — и это не поломка. Сторож о сне не знал и 26.10 будил
+        владельца критом «не подаёт признаков жизни» после каждого эфира
+        (gresniiiik, lazyraccoonn), а в списке «молчащих» висели полсотни
+        спящих каналов. Спать в эфире продукт разрешает только забанившему
+        каналу и бесплатному без прав модератора — они разобраны выше. Тут
+        поломка одна: эфир идёт, а бот так и не вошёл (менеджеру на это
+        нужна минута). Начало эфира неизвестно — не тревожим.
+        """
+        if not is_live or not started:
+            return False
+        try:
+            began = datetime.fromisoformat(str(started))
+        except ValueError:
+            return False
+        if began.tzinfo is None:
+            began = began.replace(tzinfo=timezone.utc)
+        return (datetime.now(timezone.utc) - began).total_seconds() > PLGAMESBOT_STALE_SEC
+
+    @staticmethod
     def _plgamesbot_stale(state, heartbeat):
         """Бот числится работающим, а отметок не шлёт."""
-        if state in (None, "stopped", "off"):
+        if state in (None, "stopped", "off", "sleeping"):
             return False
         if not heartbeat:
             return True

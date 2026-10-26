@@ -234,7 +234,7 @@ sudo ./watchdog/install.sh
 `WATCHDOG_CRIT_PER_DAY` раз в сутки; при исчерпании потолка разбор не
 пропадает, а уходит на обычную модель с явной пометкой в сообщении.
 
-Тесты (228): `venv/bin/python` на `watchdog/test_delta.py`,
+Тесты (233): `venv/bin/python` на `watchdog/test_delta.py`,
 `test_catalog.py`, `test_analyst.py`, `test_followup.py`, `test_converse.py`,
 `test_bot_guard.py`, `test_collect.py`, `test_notify.py`, `test_plgamesbot.py`,
 а в корне — `test_agent_auth.py` и `test_bot_ui.py`.
@@ -252,7 +252,7 @@ venv/bin/python watchdog/test_collect.py    # повторная проба са
 venv/bin/python watchdog/test_plgamesbot.py # молчащие каналы и витрина
 ```
 
-Всего 228 тестов. `test_bot_ui.py` закрывает конкретные находки аудита: секрет не
+Всего 233 теста. `test_bot_ui.py` закрывает конкретные находки аудита: секрет не
 уходит по сети ни из одного места, текст вердикта модели экранируется, порог из
 нажатия проверяется, экраны не ломаются на пустых и враждебных данных, а пороги
 бота совпадают с порогами сторожа.

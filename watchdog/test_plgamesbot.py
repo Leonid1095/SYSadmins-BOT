@@ -38,6 +38,8 @@ def _make_db(path, rows):
     con.execute("CREATE TABLE bot_status (streamer_id INTEGER PRIMARY KEY, state TEXT, "
                 "detail TEXT, send_error TEXT, is_mod INTEGER, heartbeat_at TEXT, "
                 "last_cmd TEXT, last_cmd_at TEXT)")
+    con.execute("CREATE TABLE stream_statistics (id INTEGER PRIMARY KEY, streamer_id INTEGER, "
+                "stream_started_at TEXT, platform TEXT)")
     for r in rows:
         con.execute("INSERT INTO streamers VALUES (?,?,?,?)",
                     (r["id"], r["name"], r.get("bot_on", 1), r.get("live", 0)))
@@ -46,6 +48,9 @@ def _make_db(path, rows):
                         (r["id"], r["state"], r.get("detail"), r.get("send_error"),
                          r.get("is_mod", 1), r.get("heartbeat"),
                          r.get("last_cmd"), r.get("last_cmd_at")))
+        if "started" in r:
+            con.execute("INSERT INTO stream_statistics (streamer_id, stream_started_at, platform) "
+                        "VALUES (?,?,'twitch')", (r["id"], r["started"]))
     con.commit()
     con.close()
 
@@ -110,6 +115,59 @@ class ДетекторБазы(unittest.TestCase):
     def test_на_чужой_машине_детектор_молчит(self):
         collect.PLGAMESBOT_DB = os.path.join(self.tmp.name, "нет-такого.db")
         self.assertIsNone(self.facts())
+
+
+#: С 25.10.2026 бот вне эфира спит: процесса и отметок нет, и это норма.
+SLEEPERS = [
+    {"id": 11, "name": "spit_vne_efira", "live": 0, "state": "sleeping", "is_mod": 1,
+     "heartbeat": _hb(86400)},
+    {"id": 12, "name": "spit_zabanen", "live": 0, "state": "sleeping", "is_mod": 0,
+     "detail": "бот забанен в этом канале — снимите бан: /unban plgames_bot",
+     "heartbeat": _hb(86400)},
+    # Бесплатный канал без прав модератора спит и в эфире — так решил продукт
+    {"id": 13, "name": "spit_bez_moda", "live": 1, "state": "sleeping", "is_mod": 0,
+     "heartbeat": _hb(86400), "started": _hb(3600)},
+    {"id": 14, "name": "prospal_efir", "live": 1, "state": "sleeping", "is_mod": 1,
+     "heartbeat": _hb(86400), "started": _hb(3600)},
+    {"id": 15, "name": "efir_tolko_nachalsya", "live": 1, "state": "sleeping", "is_mod": 1,
+     "heartbeat": _hb(86400), "started": _hb(30)},
+]
+
+
+class СпящийБот(unittest.TestCase):
+    """26.10.2026 сторож будил владельца критом после каждого эфира: бот
+    засыпал, отметки прекращались — «не подаёт признаков жизни»."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.db = os.path.join(self.tmp.name, "plgamesbot.db")
+        _make_db(self.db, SLEEPERS)
+        self.old = collect.PLGAMESBOT_DB
+        collect.PLGAMESBOT_DB = self.db
+
+    def tearDown(self):
+        collect.PLGAMESBOT_DB = self.old
+        self.tmp.cleanup()
+
+    def facts(self):
+        return collect.Collector().plgamesbot()
+
+    def test_сон_вне_эфира_не_поломка(self):
+        facts = self.facts()
+        everywhere = set(facts["banned"]) | set(facts["nomod"]) | set(facts["no_signal"])
+        self.assertNotIn("spit_vne_efira", everywhere)
+
+    def test_спящий_забаненный_остаётся_забаненным(self):
+        self.assertIn("spit_zabanen", self.facts()["banned"])
+
+    def test_спящий_без_модератора_остаётся_безмодным(self):
+        self.assertEqual(self.facts()["nomod"], ["spit_bez_moda"])
+
+    def test_проспал_эфир_это_нет_сигнала(self):
+        self.assertEqual(self.facts()["no_signal"], ["prospal_efir"])
+
+    def test_минута_на_пробуждение_не_тревога(self):
+        self.assertNotIn("efir_tolko_nachalsya", self.facts()["no_signal"])
 
 
 class СверкаСВитриной(unittest.TestCase):
