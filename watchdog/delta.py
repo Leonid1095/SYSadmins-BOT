@@ -322,6 +322,9 @@ class DeltaBuilder:
             code = entry.get("http")
             slot = f"http.{url}"
             was = self.previous_bands.get(slot, "ok")
+            if entry.get("planned_restart"):
+                self.bands[slot] = was          # выкладка PLGamesBot: не знаем
+                continue
             now = "ok" if code is not None and 200 <= code < 400 else "crit"
             self.bands[slot] = now
             self._emit("http", url, was, now,
@@ -403,6 +406,8 @@ class DeltaBuilder:
         ]
         for section, field, severity, ignore in sources:
             before, after = previous_facts.get(section), facts.get(section)
+            if (section, field) in CONFIRM_TWICE and before is not None and after is not None:
+                _confirm_twice(before, after, field)
             # Раздела не было в прошлом снимке — это первое наблюдение, а не
             # залп аварий: ровно так же ведёт себя только что добавленный
             # сервер. Иначе включение нового детектора означало бы пачку
@@ -423,6 +428,29 @@ class DeltaBuilder:
             for item in sorted(was - now):
                 self._emit(section, item, severity, "ok",
                            describe_list(field, recovered=True), list_field=field)
+
+
+#: Списки, где тревога — только со второго наблюдения подряд. Снимок раз в пять
+#: минут видит и секундные щели: 26.10.2026 бот PLGamesBot просыпался, писал
+#: «connected», а первую отметку — через полминуты, и четыре раза за вечер
+#: сторож попадал в эту щель («cors0vod замолчал больше суток»). Настоящая
+#: поломка видна и через пять минут, а щель — нет.
+CONFIRM_TWICE = {
+    ("plgamesbot", "no_signal"),
+    ("plgamesbot_public", "advertised_silent"),
+    ("plgamesbot_public", "unreachable"),
+}
+
+
+def _confirm_twice(before, after, field):
+    """`after[field]` — подтверждённые: видны сейчас и были видны прошлым проходом
+    (или уже подтверждены). Сырое наблюдение — в `<field>_raw`, ради следующего
+    прохода. Выздоровление — сразу, с первого чистого наблюдения."""
+    raw_now = set(after.get(field) or [])
+    raw_prev = set(before.get(field + "_raw", before.get(field)) or [])
+    confirmed_prev = set(before.get(field) or [])
+    after[field + "_raw"] = sorted(raw_now)
+    after[field] = sorted(raw_now & (raw_prev | confirmed_prev))
 
 
 def load_state():

@@ -19,6 +19,7 @@ import os
 import sqlite3
 import sys
 import tempfile
+import time
 import unittest
 from datetime import datetime, timedelta, timezone
 
@@ -39,7 +40,7 @@ def _make_db(path, rows):
                 "detail TEXT, send_error TEXT, is_mod INTEGER, heartbeat_at TEXT, "
                 "updated_at TEXT, last_cmd TEXT, last_cmd_at TEXT)")
     con.execute("CREATE TABLE stream_statistics (id INTEGER PRIMARY KEY, streamer_id INTEGER, "
-                "stream_started_at TEXT, platform TEXT)")
+                "stream_started_at TEXT, stream_ended_at TEXT, platform TEXT)")
     for r in rows:
         con.execute("INSERT INTO streamers VALUES (?,?,?,?)",
                     (r["id"], r["name"], r.get("bot_on", 1), r.get("live", 0)))
@@ -51,6 +52,10 @@ def _make_db(path, rows):
         if "started" in r:
             con.execute("INSERT INTO stream_statistics (streamer_id, stream_started_at, platform) "
                         "VALUES (?,?,'twitch')", (r["id"], r["started"]))
+        if "ended_stream" in r:          # прошлый эфир, уже закрытый
+            con.execute("INSERT INTO stream_statistics (streamer_id, stream_started_at, "
+                        "stream_ended_at, platform) VALUES (?,?,?,'twitch')",
+                        (r["id"], r["ended_stream"][0], r["ended_stream"][1]))
     con.commit()
     con.close()
 
@@ -156,7 +161,65 @@ SLEEPERS = [
      "heartbeat": _hb(86400), "started": _hb(3600)},
     {"id": 15, "name": "efir_tolko_nachalsya", "live": 1, "state": "sleeping", "is_mod": 1,
      "heartbeat": _hb(86400), "started": _hb(30)},
+    # Таймаут, закрытый чат — продукт выставленного бота держит спящим и в эфире
+    {"id": 16, "name": "v_taimaute", "live": 1, "state": "sleeping", "is_mod": 1,
+     "detail": "бот в таймауте — снимите: /untimeout plgames_bot",
+     "heartbeat": _hb(86400), "started": _hb(3600)},
+    {"id": 17, "name": "chat_zakryt", "live": 1, "state": "sleeping", "is_mod": 1,
+     "detail": "канал закрыт для сообщений бота", "heartbeat": _hb(86400), "started": _hb(3600)},
+    # «В эфире» уже стоит, а запись нового эфира ещё не заведена: прошлый закрыт
+    {"id": 18, "name": "zapis_esche_net", "live": 1, "state": "sleeping", "is_mod": 1,
+     "heartbeat": _hb(86400), "ended_stream": (_hb(2 * 86400), _hb(86400))},
 ]
+
+
+class ПлановыйПерезапуск(unittest.TestCase):
+    """Выкладка PLGamesBot: `restart_prod.sh` ставит отметку и делает pkill.
+    Перезапуск дольше трёх проб по 4 с — упавший в эти минуты сайт не авария."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.old_mark = collect.PLGAMESBOT_PLANNED_MARK
+        collect.PLGAMESBOT_PLANNED_MARK = os.path.join(self.tmp.name, "mark")
+        self.old_targets = collect.Collector._configured_endpoints
+        self.old_probe = collect.Collector._probe_endpoint
+        self.old_cert = collect.Collector._cert_days_left
+        collect.Collector._configured_endpoints = lambda self: [
+            "https://plgamesbot.ru", "https://other.example"]
+        collect.Collector._probe_endpoint = lambda self, url: {"http": 502}
+        collect.Collector._cert_days_left = lambda self, url: None
+
+    def tearDown(self):
+        collect.PLGAMESBOT_PLANNED_MARK = self.old_mark
+        collect.Collector._configured_endpoints = self.old_targets
+        collect.Collector._probe_endpoint = self.old_probe
+        collect.Collector._cert_days_left = self.old_cert
+        self.tmp.cleanup()
+
+    def test_без_отметки_сайт_лежит(self):
+        self.assertIn("https://plgamesbot.ru", collect.Collector().endpoints())
+
+    def test_с_отметкой_сайт_не_известен_а_чужой_лежит(self):
+        open(collect.PLGAMESBOT_PLANNED_MARK, "w").close()
+        facts = {"endpoints": collect.Collector().endpoints()}
+        self.assertTrue(facts["endpoints"]["https://plgamesbot.ru"].get("planned_restart"))
+        builder = delta.DeltaBuilder({"http.https://plgamesbot.ru": "ok",
+                                      "http.https://other.example": "ok"})
+        builder.http(facts)
+        self.assertEqual([e["key"] for e in builder.events], ["https://other.example"])
+        self.assertEqual(builder.bands["http.https://plgamesbot.ru"], "ok")
+
+    def test_авария_до_выкладки_не_теряется(self):
+        open(collect.PLGAMESBOT_PLANNED_MARK, "w").close()
+        builder = delta.DeltaBuilder({"http.https://plgamesbot.ru": "crit"})
+        builder.http({"endpoints": collect.Collector().endpoints()})
+        self.assertEqual(builder.bands["http.https://plgamesbot.ru"], "crit")
+
+    def test_старая_отметка_не_прячет(self):
+        open(collect.PLGAMESBOT_PLANNED_MARK, "w").close()
+        old = time.time() - collect.PLGAMESBOT_PLANNED_SEC - 60
+        os.utime(collect.PLGAMESBOT_PLANNED_MARK, (old, old))
+        self.assertNotIn("planned_restart", collect.Collector().endpoints()["https://plgamesbot.ru"])
 
 
 class СпящийБот(unittest.TestCase):
@@ -193,6 +256,16 @@ class СпящийБот(unittest.TestCase):
 
     def test_минута_на_пробуждение_не_тревога(self):
         self.assertNotIn("efir_tolko_nachalsya", self.facts()["no_signal"])
+
+    def test_таймаут_и_закрытый_чат_как_бан(self):
+        facts = self.facts()
+        self.assertIn("v_taimaute", facts["banned"])
+        self.assertIn("chat_zakryt", facts["banned"])
+        self.assertNotIn("v_taimaute", facts["no_signal"])
+
+    def test_начало_эфира_только_из_открытой_записи(self):
+        """Прошлый эфир позавчера — не начало этого: менеджеру ещё не дали минуты."""
+        self.assertNotIn("zapis_esche_net", self.facts()["no_signal"])
 
 
 class СверкаСВитриной(unittest.TestCase):
@@ -269,13 +342,44 @@ class ДельтаПоКаналам(unittest.TestCase):
         self.assertEqual(builder.events, [])
 
     def test_замолчавший_без_внешней_причины_бот_будит_модель(self):
-        """А это наша поломка: бота никто не выгонял, он просто молчит."""
-        was = {"plgamesbot": {"banned": [], "nomod": [], "no_signal": []}}
+        """А это наша поломка: бота никто не выгонял, он просто молчит —
+        две проверки подряд."""
+        was = {"plgamesbot": {"banned": [], "nomod": [], "no_signal": [],
+                              "no_signal_raw": ["molchit"]}}
         now = {"plgamesbot": {"banned": [], "nomod": [], "no_signal": ["molchit"]}}
         builder = delta.DeltaBuilder({})
         builder.lists(was, now, delta.ignored())
         self.assertEqual([(e["kind"], e["key"], e["severity"]) for e in builder.events],
                          [("plgamesbot", "molchit", "crit")])
+
+    def test_одна_проверка_не_тревога(self):
+        """26.10.2026: четыре раза за вечер сторож заглядывал в полминуты между
+        «проснулся» и первой отметкой. Один взгляд — не тревога; второй проход
+        уже видит бота живым, и владелец ничего не получает."""
+        quiet = {"plgamesbot": {"banned": [], "nomod": [], "no_signal": [], "no_signal_raw": []}}
+        glimpse = {"plgamesbot": {"banned": [], "nomod": [], "no_signal": ["cors0vod"]}}
+        builder = delta.DeltaBuilder({})
+        builder.lists(quiet, glimpse, delta.ignored())
+        self.assertEqual(builder.events, [])
+        self.assertEqual((glimpse["plgamesbot"]["no_signal"],
+                          glimpse["plgamesbot"]["no_signal_raw"]), ([], ["cors0vod"]))
+        later = {"plgamesbot": {"banned": [], "nomod": [], "no_signal": []}}
+        builder = delta.DeltaBuilder({})
+        builder.lists(glimpse, later, delta.ignored())
+        self.assertEqual(builder.events, [])                # и «вернулось» не шлём
+
+    def test_подтверждённая_тревога_снимается_с_первого_чистого_прохода(self):
+        was = {"plgamesbot": {"banned": [], "nomod": [], "no_signal": ["molchit"],
+                              "no_signal_raw": ["molchit"]}}
+        still = {"plgamesbot": {"banned": [], "nomod": [], "no_signal": ["molchit"]}}
+        builder = delta.DeltaBuilder({})
+        builder.lists(was, still, delta.ignored())
+        self.assertEqual(builder.events, [])                # не повторяем
+        fixed = {"plgamesbot": {"banned": [], "nomod": [], "no_signal": []}}
+        builder = delta.DeltaBuilder({})
+        builder.lists(still, fixed, delta.ignored())
+        self.assertEqual([(e["key"], e["severity"]) for e in builder.events],
+                         [("molchit", "resolved")])
 
     def test_давно_забаненный_молчит(self):
         """Сегодняшние молчащие каналы не превращаются в крит каждые пять минут."""
@@ -286,7 +390,8 @@ class ДельтаПоКаналам(unittest.TestCase):
         self.assertEqual(builder.events, [])
 
     def test_показ_молчащего_канала_это_крит(self):
-        was = {"plgamesbot_public": {"advertised_silent": [], "unreachable": []}}
+        was = {"plgamesbot_public": {"advertised_silent": [], "unreachable": [],
+                                     "advertised_silent_raw": ["zabanili"]}}
         now = {"plgamesbot_public": {"advertised_silent": ["zabanili"], "unreachable": []}}
         builder = delta.DeltaBuilder({})
         builder.lists(was, now, delta.ignored())
@@ -294,7 +399,8 @@ class ДельтаПоКаналам(unittest.TestCase):
                          [("zabanili", "crit")])
 
     def test_сломанная_проверка_не_крит_но_и_не_тишина(self):
-        was = {"plgamesbot_public": {"advertised_silent": [], "unreachable": []}}
+        was = {"plgamesbot_public": {"advertised_silent": [], "unreachable": [],
+                                     "unreachable_raw": ["/api/streams/live"]}}
         now = {"plgamesbot_public": {"advertised_silent": [],
                                      "unreachable": ["/api/streams/live"]}}
         builder = delta.DeltaBuilder({})

@@ -54,6 +54,15 @@ PLGAMESBOT_API = "http://127.0.0.1:8001"
 #: продуктового (90 с): иначе снимок, попавший на перезапуск служб, объявил бы
 #: молчащими сразу всех.
 PLGAMESBOT_STALE_SEC = 300
+#: Плановый перезапуск PLGamesBot: отметку ставит его `scripts/restart_prod.sh`
+#: перед pkill. Сайт в эти секунды отвечает 502 — это выкладка, а не авария
+PLGAMESBOT_PLANNED_MARK = "/home/plg/.cache/plg_watch_planned_restart"
+PLGAMESBOT_PLANNED_SEC = 180
+PLGAMESBOT_HOSTS = ("plgamesbot.ru",)
+#: Канал сам выставил бота — продукт держит его спящим даже в эфире
+#: (`PLGamesBot/bot_status.CHANNEL_SHUT_OUT`: бан, таймаут, закрытый для бота
+#: чат, канал заблокирован Twitch). Слова — из причин, которые пишет продукт.
+PLGAMESBOT_SHUT_OUT = ("бан", "таймаут", "закрыт для сообщений бота", "заблокирован twitch")
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 LOCAL_CONF = os.path.join(BASE_DIR, "monitor.local.conf")
@@ -254,6 +263,14 @@ class Collector:
                 if days is not None:
                     entry["cert_days"] = days
                 out[url] = entry
+        # Выкладка PLGamesBot: перезапуск дольше трёх проб по четыре секунды.
+        # Упавший в эти минуты адрес — «не знаем», а не «лежит»: дельта держит
+        # прежнее состояние, не поднимая и не снимая тревогу
+        if _planned_plgamesbot_restart():
+            for url, e in out.items():
+                if any(h in url for h in PLGAMESBOT_HOSTS) and (
+                        e.get("http") is None or e["http"] >= 500):
+                    e["planned_restart"] = True
         return out
 
     def _probe_endpoint(self, url):
@@ -466,12 +483,16 @@ class Collector:
         uri = "file:%s?mode=ro" % PLGAMESBOT_DB
         con = sqlite3.connect(uri, uri=True, timeout=CMD_TIMEOUT)
         try:
-            # Начало эфира — ради спящего бота: проснуться он должен с эфиром
+            # Начало эфира — ради спящего бота: проснуться он должен с эфиром.
+            # Только открытая запись: монитор ставит «в эфире» чуть раньше, чем
+            # заводит запись нового эфира, и max() по всем дал бы начало
+            # прошлого — «проспал эфир» в первые же секунды
             return con.execute(
                 "SELECT s.twitch_username, s.is_stream_live, b.state, b.detail, "
                 "       b.send_error, b.is_mod, b.heartbeat_at, b.updated_at, "
                 "       (SELECT max(t.stream_started_at) FROM stream_statistics t "
-                "         WHERE t.streamer_id = s.twitch_id AND t.platform = 'twitch') "
+                "         WHERE t.streamer_id = s.twitch_id AND t.platform = 'twitch' "
+                "           AND t.stream_ended_at IS NULL) "
                 "  FROM streamers s LEFT JOIN bot_status b ON b.streamer_id = s.twitch_id "
                 " WHERE s.is_bot_active = 1"
             ).fetchall()
@@ -493,7 +514,9 @@ class Collector:
             if is_live:
                 live.add(name)
             reason = "%s %s" % (detail or "", send_error or "")
-            if state in ("error", "sleeping") and "бан" in reason.lower():
+            if state in ("error", "sleeping") and any(w in reason.lower() for w in PLGAMESBOT_SHUT_OUT):
+                # Не только бан: за таймаут и закрытый чат продукт тоже усыпляет
+                # бота в эфире, и без этого он попал бы в «проспал эфир»
                 banned.append(name)
             elif state in ("connected", "error", "sleeping") and not is_mod:
                 # Без прав модератора бот молчит намеренно (решение 06.09.2026):
@@ -594,6 +617,14 @@ class Collector:
         # `live` из базы здесь не фильтр, а страховка: в списке и так только
         # те, кого продукт считает идущими в эфире.
         return {"advertised_silent": sorted(shown & silent), "unreachable": []}
+
+
+def _planned_plgamesbot_restart(now=None):
+    try:
+        age = (now or time.time()) - os.path.getmtime(PLGAMESBOT_PLANNED_MARK)
+    except OSError:
+        return False
+    return 0 <= age <= PLGAMESBOT_PLANNED_SEC
 
 
 def collect():

@@ -324,9 +324,14 @@ class ПервоеНаблюдениеСписка(unittest.TestCase):
         self.assertEqual(self.events({}, self.FACTS), [])
 
     def test_дальше_ведёт_себя_как_обычно(self):
-        now = {"plgamesbot": {"banned": [], "nomod": [],
-                              "no_signal": ["k1sume_qq", "shuranikola"]}}
-        self.assertEqual([e["key"] for e in self.events(self.FACTS, now)], ["shuranikola"])
+        """`no_signal` подтверждается вторым проходом подряд (26.10.2026): первый
+        взгляд на новый канал — молчание, второй — крит."""
+        def now():
+            return {"plgamesbot": {"banned": [], "nomod": [],
+                                   "no_signal": ["k1sume_qq", "shuranikola"]}}
+        first = now()
+        self.assertEqual(self.events(self.FACTS, first), [])
+        self.assertEqual([e["key"] for e in self.events(first, now())], ["shuranikola"])
 
     def test_детектор_не_отработал_это_не_починка(self):
         """Раздела нет в снимке — сказать нечего, а не «всё хорошо»."""
@@ -358,10 +363,16 @@ class ЧужаяЗонаОтветственности(unittest.TestCase):
     }
 
     def найти(self, section, field, items):
-        now = {k: dict(v) for k, v in self.BEFORE.items()}
-        now[section][field] = items
+        """Два прохода подряд: бот-тревоги подтверждаются вторым (26.10.2026)."""
+        def now():
+            snap = {k: dict(v) for k, v in self.BEFORE.items()}
+            snap[section][field] = list(items)
+            return snap
+        first = now()
         builder = delta.DeltaBuilder({})
-        builder.lists(self.BEFORE, now, delta.ignored())
+        builder.lists(self.BEFORE, first, delta.ignored())
+        builder = delta.DeltaBuilder({})
+        builder.lists(first, now(), delta.ignored())
         return builder.events
 
     def test_бан_не_поднимает_тревогу(self):
