@@ -469,7 +469,7 @@ class Collector:
             # Начало эфира — ради спящего бота: проснуться он должен с эфиром
             return con.execute(
                 "SELECT s.twitch_username, s.is_stream_live, b.state, b.detail, "
-                "       b.send_error, b.is_mod, b.heartbeat_at, "
+                "       b.send_error, b.is_mod, b.heartbeat_at, b.updated_at, "
                 "       (SELECT max(t.stream_started_at) FROM stream_statistics t "
                 "         WHERE t.streamer_id = s.twitch_id AND t.platform = 'twitch') "
                 "  FROM streamers s LEFT JOIN bot_status b ON b.streamer_id = s.twitch_id "
@@ -486,7 +486,7 @@ class Collector:
         PLGamesBot — его собственная самопроверка об этом не скажет.
         """
         banned, nomod, no_signal, live = [], [], [], set()
-        for (name, is_live, state, detail, send_error, is_mod, heartbeat,
+        for (name, is_live, state, detail, send_error, is_mod, heartbeat, updated,
              started) in self._plgamesbot_rows():
             if not name:
                 continue
@@ -502,7 +502,7 @@ class Collector:
             elif state == "sleeping":
                 if self._plgamesbot_overslept(is_live, started):
                     no_signal.append(name)
-            elif self._plgamesbot_stale(state, heartbeat):
+            elif self._plgamesbot_stale(state, heartbeat, updated):
                 no_signal.append(name)
         return sorted(banned), sorted(nomod), sorted(no_signal), live
 
@@ -530,18 +530,27 @@ class Collector:
         return (datetime.now(timezone.utc) - began).total_seconds() > PLGAMESBOT_STALE_SEC
 
     @staticmethod
-    def _plgamesbot_stale(state, heartbeat):
-        """Бот числится работающим, а отметок не шлёт."""
+    def _plgamesbot_stale(state, heartbeat, updated=None):
+        """Бот числится работающим, а отметок не шлёт.
+
+        Смена состояния — тоже признак жизни: её пишет сам процесс. 26.10.2026
+        бот cors0vod проснулся (стример открыл кабинет) и записал «connected»,
+        а первая отметка приходит через полминуты — в строке до неё стояла
+        отметка прошлого сна, и сторож в эти секунды увидел «молчит сутки»."""
         if state in (None, "stopped", "off", "sleeping"):
             return False
-        if not heartbeat:
+        seen = None
+        for mark in (heartbeat, updated):
+            try:
+                at = datetime.fromisoformat(str(mark)) if mark else None
+            except ValueError:
+                at = None
+            if at is not None and at.tzinfo is None:
+                at = at.replace(tzinfo=timezone.utc)
+            if at is not None and (seen is None or at > seen):
+                seen = at
+        if seen is None:
             return True
-        try:
-            seen = datetime.fromisoformat(str(heartbeat))
-        except ValueError:
-            return True
-        if seen.tzinfo is None:
-            seen = seen.replace(tzinfo=timezone.utc)
         return (datetime.now(timezone.utc) - seen).total_seconds() > PLGAMESBOT_STALE_SEC
 
     def plgamesbot(self):

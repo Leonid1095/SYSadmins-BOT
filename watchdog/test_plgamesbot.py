@@ -37,16 +37,16 @@ def _make_db(path, rows):
     # ловиться тестом, а не молчаливым «сбор контекста не удался» на проде.
     con.execute("CREATE TABLE bot_status (streamer_id INTEGER PRIMARY KEY, state TEXT, "
                 "detail TEXT, send_error TEXT, is_mod INTEGER, heartbeat_at TEXT, "
-                "last_cmd TEXT, last_cmd_at TEXT)")
+                "updated_at TEXT, last_cmd TEXT, last_cmd_at TEXT)")
     con.execute("CREATE TABLE stream_statistics (id INTEGER PRIMARY KEY, streamer_id INTEGER, "
                 "stream_started_at TEXT, platform TEXT)")
     for r in rows:
         con.execute("INSERT INTO streamers VALUES (?,?,?,?)",
                     (r["id"], r["name"], r.get("bot_on", 1), r.get("live", 0)))
         if "state" in r:
-            con.execute("INSERT INTO bot_status VALUES (?,?,?,?,?,?,?,?)",
+            con.execute("INSERT INTO bot_status VALUES (?,?,?,?,?,?,?,?,?)",
                         (r["id"], r["state"], r.get("detail"), r.get("send_error"),
-                         r.get("is_mod", 1), r.get("heartbeat"),
+                         r.get("is_mod", 1), r.get("heartbeat"), r.get("updated"),
                          r.get("last_cmd"), r.get("last_cmd_at")))
         if "started" in r:
             con.execute("INSERT INTO stream_statistics (streamer_id, stream_started_at, platform) "
@@ -115,6 +115,31 @@ class ДетекторБазы(unittest.TestCase):
     def test_на_чужой_машине_детектор_молчит(self):
         collect.PLGAMESBOT_DB = os.path.join(self.tmp.name, "нет-такого.db")
         self.assertIsNone(self.facts())
+
+
+class Проснулся(unittest.TestCase):
+    """26.10.2026, cors0vod: бот проснулся и записал «connected» в 18:44:27, первая
+    отметка — через полминуты, сторож заглянул в 18:44:40 и увидел отметку
+    прошлого сна. Смена состояния — тоже признак жизни."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.db = os.path.join(self.tmp.name, "plgamesbot.db")
+        _make_db(self.db, [
+            {"id": 21, "name": "tolko_prosnulsya", "live": 0, "state": "connected",
+             "heartbeat": _hb(86400), "updated": _hb(13)},
+            {"id": 22, "name": "davno_molchit", "live": 0, "state": "connected",
+             "heartbeat": _hb(86400), "updated": _hb(86400)},
+        ])
+        self.old = collect.PLGAMESBOT_DB
+        collect.PLGAMESBOT_DB = self.db
+
+    def tearDown(self):
+        collect.PLGAMESBOT_DB = self.old
+        self.tmp.cleanup()
+
+    def test_только_проснулся_не_молчит(self):
+        self.assertEqual(collect.Collector().plgamesbot()["no_signal"], ["davno_molchit"])
 
 
 #: С 25.10.2026 бот вне эфира спит: процесса и отметок нет, и это норма.
