@@ -21,6 +21,7 @@ import sqlite3
 import ssl
 import subprocess
 import sys
+import time
 import urllib.error
 import urllib.request
 from datetime import datetime, timezone
@@ -29,6 +30,16 @@ from datetime import datetime, timezone
 # зависший smartctl не должен наложиться на следующий запуск.
 CMD_TIMEOUT = 15
 NET_TIMEOUT = 8
+# Одиночная проба сайта врала. 18.09.2026 unattended-upgrades обновил
+# libsqlite3 и perl, needrestart перезапустил их потребителей — vkadmin (:8000)
+# и main_app (:8001), — и пять секунд nginx отдавал 502. Проба попала ровно в
+# это окно, и владелец получил красное «бэкенды не слушают» про плановое
+# обслуживание. По дням автообновлений так выходило примерно раз в неделю.
+#
+# Трёх проб с паузой хватает на восемь секунд — вдвое дольше наблюдавшегося
+# окна. Настоящее падение живёт дольше и пройдёт все три.
+ENDPOINT_TRIES = 3
+ENDPOINT_RETRY_PAUSE = 4
 # Обходной маршрут до удалённых агентов идёт через VPN и заметно медленнее:
 # измеренный ответ приходил за ~17 секунд. Прямой путь оставляем быстрым, чтобы
 # не ждать впустую там, где связи просто нет.
@@ -229,12 +240,35 @@ class Collector:
         targets = self._configured_endpoints()
         if not targets:
             return None
-        # Прокси обходим намеренно. Юниту он задан ради Telegram и модели, но
-        # свои же домены надо проверять так, как их видит обычный посетитель, —
-        # иначе сторож будет докладывать о доступности чужого выходного узла.
-        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        # Домены обходим разом. Поодиночке восемь адресов с повторами стоили
+        # бы минут, а снимок, который собирают половину интервала сторожа, уже
+        # не снимок — ровно та причина, по которой разом ходят и агенты ниже.
         out = {}
-        for url in targets:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+            futures = {pool.submit(self._probe_endpoint, url): url
+                       for url in targets}
+            for future in concurrent.futures.as_completed(futures):
+                url = futures[future]
+                entry = future.result()
+                days = self._cert_days_left(url)
+                if days is not None:
+                    entry["cert_days"] = days
+                out[url] = entry
+        return out
+
+    def _probe_endpoint(self, url):
+        """Проба одного адреса, с повтором того, что похоже на перезапуск.
+
+        Прокси обходим намеренно. Юниту он задан ради Telegram и модели, но
+        свои же домены надо проверять так, как их видит обычный посетитель, —
+        иначе сторож будет докладывать о доступности чужого выходного узла.
+
+        Opener заводим свой на каждую пробу: `OpenerDirector` потокобезопасным
+        себя не объявляет, а пробы идут одновременно.
+        """
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        entry = {}
+        for attempt in range(ENDPOINT_TRIES):
             entry = {}
             try:
                 req = urllib.request.Request(url, method="GET",
@@ -246,11 +280,14 @@ class Collector:
             except Exception as exc:
                 entry["http"] = None
                 entry["error"] = type(exc).__name__
-            days = self._cert_days_left(url)
-            if days is not None:
-                entry["cert_days"] = days
-            out[url] = entry
-        return out
+            code = entry.get("http")
+            # 4xx сервер дал осознанно, и повтор его не изменит. Ждём только
+            # 5xx и сетевую ошибку: так выглядит служба, которую перезапускают.
+            if code is not None and code < 500:
+                return entry
+            if attempt + 1 < ENDPOINT_TRIES:
+                time.sleep(ENDPOINT_RETRY_PAUSE)
+        return entry
 
     def _configured_endpoints(self):
         """Достаёт ENDPOINTS=(...) из monitor.local.conf.

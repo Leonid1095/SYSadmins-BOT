@@ -156,20 +156,43 @@ class СверкаСВитриной(unittest.TestCase):
 
 
 class ДельтаПоКаналам(unittest.TestCase):
-    def test_новый_бан_будит_модель(self):
+    def test_новый_бан_не_будит_модель(self):
+        """Решение владельца 18.09.2026, отменяет прежнее «бан — это крит».
+
+        Бан снимает чужой человек в своём чате, и ни владелец, ни сторож на
+        это повлиять не могут. Продукт это уже признал: забаненному каналу не
+        пишут (`channel_health.py`) и в публичных списках его не показывают
+        (`routers/stats.py`). Сторож остался последним, кто просил о
+        невозможном, — а красный пункт, по которому не действуют, обесценивает
+        соседние.
+
+        Наша доля той же беды не потерялась: она в `advertised_silent` выше —
+        канал, который мы рекламируем вопреки правилу.
+        """
         was = {"plgamesbot": {"banned": [], "nomod": [], "no_signal": []}}
         now = {"plgamesbot": {"banned": ["zabanili"], "nomod": [], "no_signal": []}}
         builder = delta.DeltaBuilder({})
         builder.lists(was, now, delta.ignored())
-        self.assertEqual([(e["kind"], e["key"], e["severity"]) for e in builder.events],
-                         [("plgamesbot", "zabanili", "crit")])
+        self.assertEqual(builder.events, [])
 
-    def test_бан_сняли_и_это_видно(self):
+    def test_снятый_бан_тоже_молчит(self):
+        """Симметрия: о чём не сообщали как о беде, о том не сообщают и как о
+        починке. Иначе владелец получал бы «бан снят» про событие, которого
+        для него не было."""
         was = {"plgamesbot": {"banned": ["zabanili"], "nomod": [], "no_signal": []}}
         now = {"plgamesbot": {"banned": [], "nomod": [], "no_signal": []}}
         builder = delta.DeltaBuilder({})
         builder.lists(was, now, delta.ignored())
-        self.assertEqual([e["severity"] for e in builder.events], ["resolved"])
+        self.assertEqual(builder.events, [])
+
+    def test_замолчавший_без_внешней_причины_бот_будит_модель(self):
+        """А это наша поломка: бота никто не выгонял, он просто молчит."""
+        was = {"plgamesbot": {"banned": [], "nomod": [], "no_signal": []}}
+        now = {"plgamesbot": {"banned": [], "nomod": [], "no_signal": ["molchit"]}}
+        builder = delta.DeltaBuilder({})
+        builder.lists(was, now, delta.ignored())
+        self.assertEqual([(e["kind"], e["key"], e["severity"]) for e in builder.events],
+                         [("plgamesbot", "molchit", "crit")])
 
     def test_давно_забаненный_молчит(self):
         """Сегодняшние молчащие каналы не превращаются в крит каждые пять минут."""

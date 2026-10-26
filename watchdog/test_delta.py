@@ -311,7 +311,9 @@ class ПервоеНаблюдениеСписка(unittest.TestCase):
     фактах нет вовсе — молчание не равно «всё починилось».
     """
 
-    FACTS = {"plgamesbot": {"banned": ["k1sume_qq"], "nomod": [], "no_signal": []}}
+    # Носитель — `no_signal`: правило проверяется общее, а `banned` с
+    # 18.09.2026 событий не рождает вовсе (см. ЧужаяЗонаОтветственности).
+    FACTS = {"plgamesbot": {"banned": [], "nomod": [], "no_signal": ["k1sume_qq"]}}
 
     def events(self, previous, now):
         builder = delta.DeltaBuilder({})
@@ -322,8 +324,8 @@ class ПервоеНаблюдениеСписка(unittest.TestCase):
         self.assertEqual(self.events({}, self.FACTS), [])
 
     def test_дальше_ведёт_себя_как_обычно(self):
-        now = {"plgamesbot": {"banned": ["k1sume_qq", "shuranikola"],
-                              "nomod": [], "no_signal": []}}
+        now = {"plgamesbot": {"banned": [], "nomod": [],
+                              "no_signal": ["k1sume_qq", "shuranikola"]}}
         self.assertEqual([e["key"] for e in self.events(self.FACTS, now)], ["shuranikola"])
 
     def test_детектор_не_отработал_это_не_починка(self):
@@ -334,6 +336,57 @@ class ПервоеНаблюдениеСписка(unittest.TestCase):
         """А вот раздел на месте и пустой — значит поломка действительно ушла."""
         now = {"plgamesbot": {"banned": [], "nomod": [], "no_signal": []}}
         self.assertEqual([e["severity"] for e in self.events(self.FACTS, now)], ["resolved"])
+
+class ЧужаяЗонаОтветственности(unittest.TestCase):
+    """Бан и отсутствие прав модератора чинятся только руками стримера.
+
+    Решение владельца 18.09.2026: на того, кто забанил бота или не выдал
+    ему прав, продукт больше не тратит внимание. Он так себя уже и ведёт —
+    таким каналам не пишут (`PLGamesBot/channel_health.py`, решение 15.09)
+    и в публичных списках их не показывают (`PLGamesBot/routers/stats.py`).
+    Сторож оставался последним местом, где эти два состояния всё ещё чего-то
+    требовали от владельца, — а сделать он с ними ничего не может: команду
+    `/mod` или `/unban` набирает чужой человек в своём чате.
+
+    Наши собственные поломки рядом остаются критом: бот, замолчавший без
+    внешней причины, и канал, который мы рекламируем вопреки правилу.
+    """
+
+    BEFORE = {
+        "plgamesbot": {"banned": [], "nomod": [], "no_signal": []},
+        "plgamesbot_public": {"advertised_silent": [], "unreachable": []},
+    }
+
+    def найти(self, section, field, items):
+        now = {k: dict(v) for k, v in self.BEFORE.items()}
+        now[section][field] = items
+        builder = delta.DeltaBuilder({})
+        builder.lists(self.BEFORE, now, delta.ignored())
+        return builder.events
+
+    def test_бан_не_поднимает_тревогу(self):
+        self.assertEqual(self.найти("plgamesbot", "banned", ["k1sume_qq"]), [])
+
+    def test_отсутствие_прав_модератора_не_поднимает_тревогу(self):
+        self.assertEqual(self.найти("plgamesbot", "nomod", ["proxxxy404"]), [])
+
+    def test_бан_молчит_и_когда_снят(self):
+        """Симметрия: раз о беде не сообщали, «починилось» тоже не новость."""
+        before = {"plgamesbot": {"banned": ["k1sume_qq"], "nomod": [],
+                                 "no_signal": []}}
+        now = {"plgamesbot": {"banned": [], "nomod": [], "no_signal": []}}
+        builder = delta.DeltaBuilder({})
+        builder.lists(before, now, delta.ignored())
+        self.assertEqual(builder.events, [])
+
+    def test_молчащий_без_внешней_причины_бот_остаётся_критом(self):
+        найдено = self.найти("plgamesbot", "no_signal", ["atlas_nikolos"])
+        self.assertEqual([e["severity"] for e in найдено], ["crit"])
+
+    def test_реклама_молчащего_канала_остаётся_критом(self):
+        найдено = self.найти("plgamesbot_public", "advertised_silent", ["k1sume_qq"])
+        self.assertEqual([e["severity"] for e in найдено], ["crit"])
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
