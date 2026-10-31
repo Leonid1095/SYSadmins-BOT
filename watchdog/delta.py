@@ -61,6 +61,13 @@ REMOTE_RISING = {
 CERT_DAYS = (30, 10)   # warn / crit — предупредить, пока продление ещё возможно
 DEADBAND = 3           # запас на выход из полосы вниз
 
+# Рассинхрон в комнате Civilization — состояние, а не событие. Короткий
+# эпизод (до минуты) — это «warn»: движок сам пересобирает мир, игрок может
+# даже не заметить. Длинный (три минуты и больше) — «crit»: рассинхрон
+# разошёлся, и по плану OOS.md игроку нужен перезаход.
+OOS_WARN_SEC = 60
+OOS_CRIT_SEC = 180
+
 # Дребезг: объект, который циклит crit→resolved→crit, будил бы модель каждые
 # пять минут и выедал подписку, ничего не сообщая сверх первого раза. После
 # FLAP_LIMIT смен полосы за FLAP_WINDOW он замолкает на FLAP_MUTE, а владелец
@@ -375,6 +382,59 @@ class DeltaBuilder:
             self.bands[slot] = now
             self._emit("smart", dev, was, now, f"самопроверка — {verdict}", slot=slot)
 
+    def civ4(self, facts):
+        """Рассинхрон в комнатах Civilization.
+
+        Агент комнат уже разобрал журнал движка и написал, у кого идёт
+        рассинхрон; здесь это просто полоса. Важны две вещи.
+
+        Первая: рассинхрон — не мгновенное событие, а состояние, которое
+        длится. Поэтому пороги по времени, а не по факту появления: короткий
+        эпизод — это «warn», длинный — «crit». Так владелец получает одно
+        сообщение вместо пяти «началось/началось/началось».
+
+        Вторая: комната, которой больше нет, рассинхрон закончила сама.
+        Молчать о ней нельзя — иначе полоса навсегда останется красной.
+        """
+        data = facts.get("civ4")
+        if not isinstance(data, dict):
+            return
+
+        for room, value in data.items():
+            episodes = (value or {}).get("episodes") or []
+            if episodes:
+                longest = max(int(e.get("sec") or 0) for e in episodes)
+                who = ", ".join(
+                    f"{e.get('name')} ({int(e.get('sec') or 0)} с)"
+                    for e in sorted(episodes, key=lambda e: -int(e.get("sec") or 0))[:3])
+                if longest >= OOS_CRIT_SEC:
+                    now = "crit"
+                elif longest >= OOS_WARN_SEC:
+                    now = "warn"
+                else:
+                    now = "warn"
+                detail = f"рассинхрон у {who}"
+            else:
+                now = "ok"
+                detail = "рассинхрона нет"
+
+            slot = f"civ4.{room}"
+            was = self.previous_bands.get(slot, "ok")
+            self.bands[slot] = now
+            self._emit("civ4", room, was, now, detail, slot=slot)
+
+        # Комнаты, которых больше нет: рассинхрон закончился вместе с комнатой.
+        for slot in list(self.previous_bands):
+            if not slot.startswith("civ4."):
+                continue
+            room = slot.split(".", 1)[1]
+            if room in data:
+                continue
+            was = self.previous_bands[slot]
+            self.bands[slot] = "ok"
+            self._emit("civ4", room, was, "ok", "комната больше не работает",
+                       slot=slot)
+
     def lists(self, previous_facts, facts, skip):
         """Списки сравниваем поимённо: замена одной поломки другой не должна
         пройти молча только потому, что счётчик не изменился."""
@@ -494,6 +554,7 @@ def compare(snapshot, state):
     builder.http(facts)
     builder.smart(facts)
     builder.remote(facts)
+    builder.civ4(facts)
     builder.lists(state.get("facts", {}), facts, skip)
     return builder.events, builder.bands, False, builder.flap
 

@@ -50,6 +50,11 @@ REMOTE_PROXY_TIMEOUT = 40
 # сам молчит там, где базы нет, и на чужом сервере ничего не стоит.
 PLGAMESBOT_DB = "/home/plg/PLGamesBot/plgamesbot.db"
 PLGAMESBOT_API = "http://127.0.0.1:8001"
+
+# Civilization: комнаты поднимаются по требованию, и агент комнат ведёт рядом с
+# каждой `gameN/log/net.json` — кто в комнате и у кого идёт рассинхрон.
+# Сторожу достаточно этого файла: разбирать журнал движка заново не нужно.
+CIV4_ROOMS_DIR = "/home/plg/Civilization/server-deploy/docker"
 #: Сторож ходит раз в пять минут, поэтому его порог «нет сигнала» грубее
 #: продуктового (90 с): иначе снимок, попавший на перезапуск служб, объявил бы
 #: молчащими сразу всех.
@@ -618,6 +623,50 @@ class Collector:
         # те, кого продукт считает идущими в эфире.
         return {"advertised_silent": sorted(shown & silent), "unreachable": []}
 
+    def civ4(self):
+        """Рассинхрон в комнатах Civilization.
+
+        Агент комнат (`room-agent.py`) читает сетевой журнал движка и пишет
+        `gameN/log/net.json`: кто в комнате и у кого идёт рассинхрон. Мы берём
+        уже разобранный факт — разбирать журнал заново незачем и рискованно.
+
+        Комнат может не быть вовсе (они поднимаются по требованию), и это
+        норма: пустой раздел означает «никто не играет», а не «всё хорошо».
+        """
+        out = {}
+        try:
+            entries = sorted(os.listdir(CIV4_ROOMS_DIR))
+        except OSError:
+            return None
+        for entry in entries:
+            if not re.fullmatch(r"game\d*", entry):
+                continue
+            path = os.path.join(CIV4_ROOMS_DIR, entry, "log", "net.json")
+            try:
+                with open(path, encoding="utf-8") as f:
+                    data = json.load(f)
+            except (OSError, json.JSONDecodeError):
+                continue
+            if not isinstance(data, dict):
+                continue
+            people = {}
+            for person in data.get("people") or []:
+                if isinstance(person, dict):
+                    people[person.get("netid")] = person
+            episodes = []
+            for episode in data.get("oos") or []:
+                if not isinstance(episode, dict):
+                    continue
+                netid = episode.get("netid")
+                name = people.get(netid, {}).get("name") or f"игрок {netid}"
+                try:
+                    seconds = int(episode.get("sec") or 0)
+                except (TypeError, ValueError):
+                    seconds = 0
+                episodes.append({"netid": netid, "name": name, "sec": seconds})
+            out[entry] = {"episodes": episodes}
+        return out
+
 
 def _planned_plgamesbot_restart(now=None):
     try:
@@ -641,6 +690,7 @@ def collect():
     c.detect("remote", c.remote)
     c.detect("plgamesbot", c.plgamesbot)
     c.detect("plgamesbot_public", c.plgamesbot_public)
+    c.detect("civ4", c.civ4)
 
     snapshot = {
         "collected_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),

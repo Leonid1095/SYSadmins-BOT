@@ -22,13 +22,28 @@ import subprocess
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from collect import PLGAMESBOT_DB  # noqa: E402 — путь к базе определён один раз
+from collect import CIV4_ROOMS_DIR, PLGAMESBOT_DB  # noqa: E402 — пути определены один раз
 
 CMD_TIMEOUT = 20
 MAX_BYTES = 24_000   # хватает на разбор, но не топит контекст аналитика
 
 UNIT_RE = re.compile(r"^[A-Za-z0-9@._\-\\]{1,128}\.(service|socket|timer)$")
 CONTAINER_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.\-]{0,127}$")
+CIV4_ROOM_RE = re.compile(r"^game\d{0,2}$")
+
+
+def _read_tail(path, limit=MAX_BYTES):
+    """Хвост файла: у журналов важна свежая часть, а начало — это предыстория,
+    из-за которой контекст упирается в потолок."""
+    try:
+        with open(path, "rb") as f:
+            try:
+                f.seek(-limit, os.SEEK_END)
+            except OSError:
+                f.seek(0)
+            return f.read().decode("utf-8", errors="replace")
+    except OSError as exc:
+        return f"(не удалось прочитать {path}: {exc})"
 
 
 def _capture(cmd, timeout=CMD_TIMEOUT):
@@ -70,6 +85,61 @@ def _container_context(name):
              "RestartCount={{.RestartCount}} Health={{if .State.Health}}{{.State.Health.Status}}{{else}}нет{{end}}",
              "--", name]),
     }
+
+
+def _civ4_context(room):
+    """Улики рассинхрона по комнате Civilization.
+
+    Комната поднимается по требованию, и всё её хозяйство живёт рядом с ней в
+    `gameN/log/`: `net.json` (кто в комнате и у кого рассинхрон), `live.json`
+    (жива ли комната и какой разрыв) и каталог `engine-*/` с журналами движка —
+    там и строки `Sync=`, из которых рассинхрон и видно.
+
+    Ничего не запускаем и не трогаем: только читаем то, что агент комнат уже
+    собрал, и отдаём аналитику как данные.
+    """
+    if not CIV4_ROOM_RE.match(room):
+        return None
+    base = os.path.join(CIV4_ROOMS_DIR, room)
+    log_dir = os.path.join(base, "log")
+    files = {}
+
+    for name in ("net.json", "live.json"):
+        path = os.path.join(log_dir, name)
+        if os.path.isfile(path):
+            files[f"civ4-{room}-{name}"] = _read_tail(path, 32_000)
+
+    # Свежий каталог журналов движка: строки Sync= — прямые улики.
+    engine_dirs = []
+    try:
+        for entry in os.listdir(log_dir):
+            if entry.startswith("engine-"):
+                engine_dirs.append(os.path.join(log_dir, entry))
+    except OSError:
+        engine_dirs = []
+    if engine_dirs:
+        newest = max(engine_dirs, key=lambda p: os.path.getmtime(p))
+        try:
+            names = sorted(os.listdir(newest))
+        except OSError:
+            names = []
+        for entry in names:
+            if entry.startswith("network-") or entry in ("container.log", "app.log"):
+                files[f"civ4-{room}-{entry}"] = _read_tail(
+                    os.path.join(newest, entry), MAX_BYTES)
+
+    # Улики от лаунчеров: что видел клиент игрока.
+    notes_dir = os.path.join(CIV4_ROOMS_DIR, "spool", "oos-notes")
+    try:
+        notes = sorted(os.listdir(notes_dir))
+    except OSError:
+        notes = []
+    for entry in notes[-3:]:
+        path = os.path.join(notes_dir, entry)
+        if os.path.isfile(path):
+            files[f"civ4-{room}-note-{entry}"] = _read_tail(path, MAX_BYTES)
+
+    return files
 
 
 def _disk_context(_key):
@@ -197,6 +267,7 @@ GATHERERS = {
     "remote": _remote_context,
     "plgamesbot": _plgamesbot_context,
     "plgamesbot_public": _plgamesbot_context,
+    "civ4": _civ4_context,
 }
 
 
