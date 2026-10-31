@@ -56,7 +56,7 @@ import time
 from datetime import datetime, timezone
 
 import sandbox
-from claude_agent_sdk import AssistantMessage, TextBlock, query
+from ai import run as ai_run
 
 MAX_TURNS = int(os.environ.get("WATCHDOG_ASK_TURNS", "8"))
 
@@ -84,9 +84,7 @@ SYSTEM_PROMPT = f"""\
 * `context/` — заранее собранные логи и раскладки по затронутым объектам;
 * `verdict.json` — твой собственный прошлый разбор.
 
-Читай их через Read и Grep. Других инструментов у тебя нет: ты ничего не
-запускаешь и ничего не меняешь. Это ограничение, а не сбой, и обходить его не
-нужно — если для ответа нужна команда, назови её владельцу, он выполнит сам.
+{{access}}
 
 {sandbox.UNTRUSTED_INPUT_WARNING}
 
@@ -205,15 +203,13 @@ def _build_prompt(question, past):
 
 
 async def _run(incident_dir, prompt):
+    # Провайдер тот же, что и у разбора: им выбирает `ai.json`. Диалог идёт на
+    # обычном уровне — уточняющие вопросы не должны незаметно уехать на сильную
+    # модель и стоить дороже самого инцидента.
     options = sandbox.options(cwd=incident_dir, system_prompt=SYSTEM_PROMPT,
-                              max_turns=MAX_TURNS)
-    chunks = []
-    async for message in query(prompt=prompt, options=options):
-        if isinstance(message, AssistantMessage):
-            for block in message.content:
-                if isinstance(block, TextBlock):
-                    chunks.append(block.text)
-    return "\n".join(chunks).strip()
+                              max_turns=MAX_TURNS, tier="normal")
+    text, _meta = await ai_run(prompt=prompt, options=options)
+    return text.strip()
 
 
 def _validate(incident_dir, question):

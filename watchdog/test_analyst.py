@@ -20,6 +20,7 @@ from datetime import datetime, timezone
 from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import ai_config       # noqa: E402
 import analyst  # noqa: E402
 import sandbox  # noqa: E402
 
@@ -56,8 +57,18 @@ class ChooseModelTest(unittest.TestCase):
         self.assertEqual(self.budget()["count"], 1)
 
     def test_сильная_модель_отличается_от_обычной(self):
-        """Иначе вся фаза — дорогая иллюзия."""
-        self.assertNotEqual(sandbox.MODEL, sandbox.MODEL_CRIT)
+        """Иначе вся фаза — дорогая иллюзия.
+
+        С 30.10.2026 сравнивать надо не имя модели, а настройку уровня целиком:
+        у MiniMax обычный и критический уровни — одна и та же модель, но разное
+        усилие. Имя совпадать может, а разбор крита обязан отличаться.
+        """
+        normal = ai_config.resolve("normal")
+        crit = ai_config.resolve("crit")
+        self.assertNotEqual(
+            (normal.get("provider"), normal.get("model"), normal.get("effort")),
+            (crit.get("provider"), crit.get("model"), crit.get("effort")),
+            "критический уровень не отличается от обычного — фаза обещана, а не сделана")
 
     def test_расход_копится_за_сутки(self):
         for expected in (1, 2, 3):

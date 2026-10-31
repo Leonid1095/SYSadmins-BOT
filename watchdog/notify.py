@@ -127,24 +127,51 @@ def api_call(token, method, payload):
 
 def render(result):
     """Собирает текст уведомления. HTML, а не MarkdownV2: экранировать надо
-    ровно три символа, и содержимое логов не превратит сообщение в кашу."""
+    ровно три символа, и содержимое логов не превратит сообщение в кашу.
+
+    Порядок — как в суточной сводке (`ops/report-format/FORMAT.md`): сначала
+    вывод, потом что можно сделать, и только потом техническая часть, свёрнутая
+    под спойлер. Кнопки под сообщением списком не читаются: у кнопки есть
+    только название, а «почему» живёт в вердикте — значит, без блока в тексте
+    владелец видит четыре названия без объяснений.
+    """
     verdict = result["verdict"]
     mark = SEVERITY_MARK.get(verdict["severity"], "⚪️")
+    options = verdict.get("options") or []
 
     lines = [f"{mark} <b>{esc(verdict['headline'])}</b>", ""]
     if verdict.get("explanation"):
         lines += [esc(verdict["explanation"]), ""]
 
-    lines.append("<i>Что изменилось:</i>")
-    for event in result.get("events", [])[:8]:
-        lines.append(describe_event(event))
-
     # Пометка о слабом разборе. Крит разбирается сильной моделью, но суточный
     # потолок таких разборов конечен, и владелец должен знать, что этот разбор
-    # сделан обычной моделью, — иначе он поверит ему ровно так же.
+    # сделан обычной моделью, — иначе он поверит ему ровно так же. Ставим
+    # сразу после вывода: это меняет доверие ко всему дальше.
     if result.get("meta", {}).get("crit_budget_exhausted"):
-        lines += ["", "<i>Суточный запас усиленных разборов исчерпан — "
-                      "это разбор обычной моделью.</i>"]
+        lines += ["<i>Суточный запас усиленных разборов исчерпан — "
+                  "это разбор обычной моделью.</i>", ""]
+
+    # Что можно сделать — до технической части.
+    actions = [o for o in options if o.get("action") != "nothing"]
+    nothing = next((o for o in options if o.get("action") == "nothing"), None)
+    if actions or nothing:
+        lines.append("<b>Что можно сделать:</b>")
+        for option in actions:
+            why = esc(option.get("why") or "")
+            label = esc(option.get("label") or option.get("action") or "")
+            lines.append(f"• {label}" + (f" — {why}" if why else ""))
+        if nothing:
+            label = esc(nothing.get("label") or "Ничего не делать")
+            lines.append(f"• {label}")
+        lines.append("")
+
+    # Техническая часть — под спойлер. Это то, по чему ничего не решается:
+    # владелец открывает её, только если захотел копнуть.
+    lines.append("<i>Что изменилось:</i>")
+    lines.append("<tg-spoiler>")
+    for event in result.get("events", [])[:8]:
+        lines.append(describe_event(event))
+    lines.append("</tg-spoiler>")
 
     # Подсказка про диалог. Без неё возможность не существует: владелец не
     # догадается, что на сообщение бота вообще можно отвечать.

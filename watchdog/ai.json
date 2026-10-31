@@ -1,0 +1,65 @@
+{
+  "_comment": [
+    "Переключатель модели для сторожа. Правь этот файл — код трогать не нужно.",
+    "Поставил — дождись следующего прохода сторожа (он одноразовый, раз в 5 минут).",
+    "",
+    "normal — обычный разбор; crit — разбор настоящего крита (сильнее и реже,",
+    "потолок WATCHDOG_CRIT_PER_DAY).",
+    "fallback / fallback_crit — запасные: если основной провайдер не ответил,",
+    "берётся следующий, и в вердикте видно, кто ответил.",
+    "",
+    "provider: anthropic | minimax | openai",
+    "  anthropic — Claude Agent SDK, подписка владельца. С 30.10.2026 Anthropic",
+    "    требует верификации организации и отвечает «403 can't receive replies».",
+    "    Пока не пройдена, этот провайдер НЕ РАБОТАЕТ. Он оставлен в цепочке",
+    "    на будущее: если верификация пройдёт, он заработает сам, без правки",
+    "    этого файла. До тех пор он не тратит время: после отказа провайдер",
+    "    уходит в остывание (cooldown_sec) и не опрашивается, пока есть кому",
+    "    ответить.",
+    "  minimax   — MiniMax Code в режиме lightweight: у модели нет инструментов,",
+    "    файлы инцидента подкладывает сторож. Основной вариант.",
+    "  openai    — любой OpenAI-совместимый адрес (ollama, vLLM, groq).",
+    "",
+    "cooldown_sec — сколько провайдер «остывает» после отказа (по умолчанию 6 ч).",
+    "Проверить, кто отвечает прямо сейчас:",
+    "  venv/bin/python watchdog/ai_check.py",
+    "",
+    "Отдельный вход MiniMax для сторожа (не деля с повседневными сессиями):",
+    "  MINIMAX_DATA_DIR=/var/lib/watchdog/minimax ~/.minimax-code/bin/mcode login --no-browser",
+    "и указать его здесь: \"data_dir\": \"/var/lib/watchdog/minimax\"."
+  ],
+
+  "normal": {
+    "provider": "minimax",
+    "model": "minimax/MiniMax-M3.1-Flash",
+    "effort": "medium",
+    "timeout_sec": 300,
+    "data_dir": "/home/plg/.minimax",
+    "cooldown_sec": 21600
+  },
+
+  "crit": {
+    "provider": "minimax",
+    "model": "minimax/MiniMax-M3.1-Flash",
+    "effort": "high",
+    "timeout_sec": 600,
+    "data_dir": "/home/plg/.minimax",
+    "cooldown_sec": 21600
+  },
+
+  "fallback": [
+    {
+      "provider": "anthropic",
+      "model": "claude-sonnet-5",
+      "cooldown_sec": 21600
+    }
+  ],
+
+  "fallback_crit": [
+    {
+      "provider": "anthropic",
+      "model": "claude-opus-5",
+      "cooldown_sec": 21600
+    }
+  ]
+}

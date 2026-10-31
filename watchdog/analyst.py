@@ -25,22 +25,48 @@ import time
 from datetime import datetime, timezone
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import catalog          # noqa: E402
-import sandbox          # noqa: E402 — граница read-only, общая с диалогом
+import ai              # noqa: E402 — вызов модели: провайдер выбирается данными
+import ai_config      # noqa: E402
+import catalog        # noqa: E402
+import sandbox        # noqa: E402 — граница read-only, общая с диалогом
 from deepen import deepen  # noqa: E402
-
-from claude_agent_sdk import (  # noqa: E402
-    AssistantMessage,
-    ResultMessage,
-    TextBlock,
-    query,
-)
 
 STATE_DIR = os.environ.get("WATCHDOG_STATE_DIR", "/var/lib/watchdog")
 INCIDENTS_DIR = os.path.join(STATE_DIR, "incidents")
 
 # Модель и граница read-only живут в sandbox.py — там же, откуда их берёт диалог.
 MAX_TURNS = int(os.environ.get("WATCHDOG_MAX_TURNS", "12"))
+
+# Форма ответа — машиночитаемая. Провайдеры, которые понимают JSON Schema,
+# получат её как схему; остальным она уходит словами в промпте.
+#
+# Схема намеренно мягкая: у варианта требуется только `action`. `label` и `why`
+# `sanitize` достраивает из каталога сам, а жёсткое «обязательно» превращало
+# в отказ целый разбор — 30.10.2026 модель не заполнила `why` у второго
+# варианта, и вместо разбора пришло «аналитик не отработал». Цена ошибки
+# формы не должна быть такой.
+VERDICT_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "severity": {"type": "string", "enum": ["crit", "warn", "info"]},
+        "headline": {"type": "string"},
+        "explanation": {"type": "string"},
+        "options": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "action": {"type": "string"},
+                    "target": {"type": ["string", "null"]},
+                    "label": {"type": "string"},
+                    "why": {"type": "string"},
+                },
+                "required": ["action"],
+            },
+        },
+    },
+    "required": ["severity", "headline", "explanation", "options"],
+}
 
 # Сколько разборов в сутки позволено делать сильной моделью. Дребезжащий крит
 # иначе выел бы общую подписку: подавление дребезга ловит частые скачки, но не
@@ -59,8 +85,7 @@ SYSTEM_PROMPT = f"""\
 * `facts.json` — полный снимок состояния машины на сейчас;
 * `context/` — заранее собранные логи и раскладки по затронутым объектам.
 
-Читай их через Read и Grep. Больше у тебя инструментов нет: ты ничего не
-запускаешь и ничего не меняешь. Это осознанное ограничение, не сбой.
+{{access}}
 
 {sandbox.UNTRUSTED_INPUT_WARNING}
 
@@ -226,29 +251,23 @@ def sanitize(verdict, events):
     }
 
 
-async def analyse(incident_dir, events, model=None):
-    """Один заход модели. Возвращает текст ответа и служебные показатели."""
+async def analyse(incident_dir, events, model=None, tier="normal"):
+    """Один заход модели. Возвращает текст ответа и служебные показатели.
+
+    Провайдера выбирает `ai_config` — то есть файл `ai.json` рядом с этим
+    модулем. Anthropic, MiniMax или любой OpenAI-совместимый адрес: смена
+    выбора не требует правки кода.
+    """
     prompt = (
         "Разберись, что произошло. Начни с events.json — это то, что изменилось. "
         "Затем посмотри facts.json и файлы в context/, относящиеся к затронутым "
         "объектам. Верни один объект JSON в оговорённом формате."
     )
     options = sandbox.options(cwd=incident_dir, system_prompt=SYSTEM_PROMPT,
-                              max_turns=MAX_TURNS, model=model)
+                              max_turns=MAX_TURNS, model=model, tier=tier,
+                              output_schema=VERDICT_SCHEMA)
 
-    chunks, meta = [], {}
-    async for message in query(prompt=prompt, options=options):
-        if isinstance(message, AssistantMessage):
-            for block in message.content:
-                if isinstance(block, TextBlock):
-                    chunks.append(block.text)
-        elif isinstance(message, ResultMessage):
-            meta = {
-                "turns": getattr(message, "num_turns", None),
-                "duration_ms": getattr(message, "duration_ms", None),
-                "is_error": getattr(message, "is_error", None),
-            }
-    return "\n".join(chunks), meta
+    return await ai.run(prompt=prompt, options=options)
 
 
 def _all_resolved(events):
@@ -298,7 +317,8 @@ def choose_model(events, now=None):
     именно в такую ночь уведомление и нужно.
     """
     if not any(e.get("severity") == "crit" for e in events):
-        return {"model": sandbox.MODEL, "upgraded": False, "exhausted": False}
+        return {"model": sandbox.MODEL, "tier": "normal",
+                "upgraded": False, "exhausted": False}
 
     path = os.path.join(STATE_DIR, BUDGET_FILE)
     today = (now or datetime.now(timezone.utc)).strftime("%Y-%m-%d")
@@ -310,8 +330,8 @@ def choose_model(events, now=None):
     used = data.get("count", 0) if data.get("day") == today else 0
 
     if used >= MAX_CRIT_UPGRADES_PER_DAY:
-        return {"model": sandbox.MODEL, "upgraded": False, "exhausted": True,
-                "used": used, "limit": MAX_CRIT_UPGRADES_PER_DAY}
+        return {"model": sandbox.MODEL, "tier": "normal", "upgraded": False,
+                "exhausted": True, "used": used, "limit": MAX_CRIT_UPGRADES_PER_DAY}
 
     # Счётчик увеличиваем до разбора, а не после. Разбор может не дойти до
     # конца, и тогда попытка окажется неучтённой — но потратит те же ресурсы.
@@ -323,8 +343,8 @@ def choose_model(events, now=None):
         os.chmod(path, 0o640)
     except OSError:
         pass
-    return {"model": sandbox.MODEL_CRIT, "upgraded": True, "exhausted": False,
-            "used": used + 1, "limit": MAX_CRIT_UPGRADES_PER_DAY}
+    return {"model": sandbox.MODEL_CRIT, "tier": "crit", "upgraded": True,
+            "exhausted": False, "used": used + 1, "limit": MAX_CRIT_UPGRADES_PER_DAY}
 
 
 def main():
@@ -367,7 +387,8 @@ def main():
 
     choice = choose_model(events)
     try:
-        text, meta = asyncio.run(analyse(incident_dir, events, choice["model"]))
+        text, meta = asyncio.run(analyse(incident_dir, events, choice["model"],
+                                         choice["tier"]))
     except Exception as exc:
         # Модель недоступна — это не повод молчать о поломке. Отдаём сырые
         # события, чтобы уведомление всё равно ушло владельцу.
@@ -396,7 +417,9 @@ def main():
     # Каким разбором это оказалось — видно и в вердикте, и в уведомлении.
     # Без этого «разобрано обычной моделью, потому что потолок исчерпан»
     # выглядело бы как «разобрано сильной», и доверять пометке было бы нельзя.
-    meta.update({"model": choice["model"], "crit_upgrade": choice["upgraded"],
+    # `model` и `provider` в meta — кто ответил на самом деле: при откате
+    # основного провайдера это запасной, и это обязано быть видно.
+    meta.update({"requested_model": choice["model"], "crit_upgrade": choice["upgraded"],
                  "crit_budget_exhausted": choice["exhausted"]})
 
     result = {

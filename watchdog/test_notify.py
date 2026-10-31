@@ -145,5 +145,51 @@ class MarkTest(unittest.TestCase):
         self.assertIn("Ответьте на это сообщение", notify.render(result([])))
 
 
+class FormatTest(unittest.TestCase):
+    """Порядок блоков: вывод → что делать → техника под спойлером.
+
+    Та же схема, что в суточной сводке (`ops/report-format/FORMAT.md`).
+    """
+
+    def _result(self):
+        res = result([{"kind": "disk", "key": "root", "severity": "crit",
+                       "detail": "раздел / заполнен на 87%"}])
+        res["verdict"]["options"] = [
+            {"action": "rotate_logs", "target": None, "label": "Почистить логи",
+             "why": "освободит место на разделе"},
+            {"action": "nothing", "target": None, "label": "Ничего не делать",
+             "why": "Принять к сведению."},
+        ]
+        return res
+
+    def test_техника_свёрнута(self):
+        text = notify.render(self._result())
+        self.assertIn("<tg-spoiler>", text)
+        self.assertIn("</tg-spoiler>", text)
+
+    def test_изменения_внутри_спойлера(self):
+        text = notify.render(self._result())
+        body = text.split("<tg-spoiler>")[1].split("</tg-spoiler>")[0]
+        self.assertIn("87%", body)
+
+    def test_что_делать_до_техники(self):
+        text = notify.render(self._result())
+        self.assertLess(text.index("Что можно сделать"), text.index("<tg-spoiler>"))
+
+    def test_у_варианта_виден_почему(self):
+        """У кнопки есть только название. «Почему» живёт в вердикте — значит,
+        без него в сообщении четыре названия без объяснений."""
+        text = notify.render(self._result())
+        self.assertIn("освободит место на разделе", text)
+
+    def test_ничего_не_делать_тоже_показано(self):
+        text = notify.render(self._result())
+        self.assertIn("Ничего не делать", text)
+
+    def test_вывод_раньше_всего(self):
+        text = notify.render(self._result())
+        self.assertLess(text.index("Пояснение"), text.index("Что можно сделать"))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
