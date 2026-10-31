@@ -26,7 +26,6 @@ from datetime import datetime, timezone
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import ai              # noqa: E402 — вызов модели: провайдер выбирается данными
-import ai_config      # noqa: E402
 import catalog        # noqa: E402
 import sandbox        # noqa: E402 — граница read-only, общая с диалогом
 from deepen import deepen  # noqa: E402

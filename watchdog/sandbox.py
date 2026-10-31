@@ -28,7 +28,6 @@ read-only от этого не слабеет: у Anthropic остаются `Re
 подкладывает наш код (см. `ai.py`).
 """
 
-import os
 from dataclasses import dataclass, field
 
 import ai_config
