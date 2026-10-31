@@ -274,7 +274,7 @@ venv/bin/python watchdog/ai_check.py anthropic  # одного
 `WATCHDOG_CRIT_PER_DAY` раз в сутки; при исчерпании потолка разбор не
 пропадает, а уходит на обычный уровень с явной пометкой в сообщении.
 
-Тесты (286): `venv/bin/python` на `watchdog/test_delta.py`,
+Тесты (292): `venv/bin/python` на `watchdog/test_delta.py`,
 `test_catalog.py`, `test_analyst.py`, `test_followup.py`, `test_converse.py`,
 `test_bot_guard.py`, `test_collect.py`, `test_notify.py`, `test_plgamesbot.py`,
 `test_ai.py`, `test_civ4.py`,
